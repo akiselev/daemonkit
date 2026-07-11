@@ -314,33 +314,17 @@ impl PathKey {
 
     pub fn file_identity(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let input = path.as_ref();
-        let metadata = std::fs::metadata(input).map_err(|error| ConfigError::PathIdentity {
-            path: input.to_owned(),
-            message: error.to_string(),
-        })?;
         #[cfg(unix)]
         let stable = {
             use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(input).map_err(|error| ConfigError::PathIdentity {
+                path: input.to_owned(),
+                message: error.to_string(),
+            })?;
             [metadata.dev().to_le_bytes(), metadata.ino().to_le_bytes()].concat()
         };
         #[cfg(windows)]
-        let stable = {
-            use std::os::windows::fs::MetadataExt;
-            let volume =
-                metadata
-                    .volume_serial_number()
-                    .ok_or_else(|| ConfigError::PathIdentity {
-                        path: input.to_owned(),
-                        message: "filesystem did not expose a volume serial number".into(),
-                    })?;
-            let index = metadata
-                .file_index()
-                .ok_or_else(|| ConfigError::PathIdentity {
-                    path: input.to_owned(),
-                    message: "filesystem did not expose a file index".into(),
-                })?;
-            [volume.to_le_bytes().to_vec(), index.to_le_bytes().to_vec()].concat()
-        };
+        let stable = windows_file_identity(input)?;
         Ok(Self {
             kind: "path-file-identity",
             path: input.to_owned(),
@@ -355,6 +339,52 @@ impl PathKey {
             stable: id.as_bytes().to_vec(),
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        },
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(ConfigError::PathIdentity {
+            path: path.to_owned(),
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    unsafe { CloseHandle(handle) };
+    if result == 0 {
+        return Err(ConfigError::PathIdentity {
+            path: path.to_owned(),
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    let index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Ok([
+        information.dwVolumeSerialNumber.to_le_bytes().to_vec(),
+        index.to_le_bytes().to_vec(),
+    ]
+    .concat())
 }
 
 impl DaemonKey for PathKey {

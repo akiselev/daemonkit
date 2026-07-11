@@ -20,6 +20,7 @@ testkit = []
 futures-core.workspace = true
 fs2.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
@@ -27,10 +28,12 @@ tokio = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 trybuild = "1.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

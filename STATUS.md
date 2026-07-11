@@ -1,7 +1,8 @@
 # Status
 
-Phase 0's executable foundation and exit-gate model are in place. Native
-lifecycle behavior has not started; Phase 1 red scenarios are next.
+Phase 0 is complete. Phase 1 native identity/root/lock/store work is in
+progress; Linux contracts are running, while Windows root ACL verification is
+still deliberately fail-closed pending its native implementation.
 
 ## Latest
 
@@ -55,12 +56,23 @@ lifecycle behavior has not started; Phase 1 red scenarios are next.
   bootstrap, publish, commit, ready, and release. Invariants run after every
   transition, seeded runs interleave waiters and replay exactly, and bounded DFS
   explores/prunes transition schedules (168 for the three-actor contract case).
-- Current gates pass: 27 unit tests, seven compile API cases, one doctest,
+- Added native private runtime-root creation/reverification. Unix verifies real
+  directory type, current UID, and mode on every access; unsafe modes and
+  symlinks fail without silent repair. Windows currently rejects roots until a
+  current-logon-only DACL verifier is installed.
+- Added stable OS file locks with no-follow/CLOEXEC Unix opens, monotonic
+  contention timeout, RAII release, and stable lock-file retention.
+- Added bounded atomic records: unique same-directory 0600 staging, write + file
+  sync + atomic replace + Unix parent sync, no-follow reads, retained corrupt
+  JSON, and semantic crash injection around every publication boundary.
+- Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
+  Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
+- Current gates pass: 36 unit tests, seven compile API cases, one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Begin Phase 1 with red secure-root, stable-lock, interrupted-publication, and
-corrupt-record scenarios; then implement native identity/root/lock/store
-contracts on Unix and Windows. Extend custom actor/spec testkit composition as
-the first downstream contract needs it.
+Continue Phase 1: implement Windows DACL root verification, bind verified roots
+to instance/generation layout handles, add lock cancellation/crash process
+fixtures, integrate typed instance records, and implement bounded generation
+retention. Then run native contract suites on Linux/macOS/Windows CI.
