@@ -411,6 +411,8 @@ pub enum Schedule {
     Fifo,
     Seeded(u64),
     Replay(ReplayToken),
+    #[doc(hidden)]
+    ExplorePrefix(Vec<usize>),
 }
 #[derive(Clone, Debug)]
 struct Actor {
@@ -520,41 +522,55 @@ impl Explorer {
             return Err(SimError::InvalidExplorerBound);
         }
         let digest = scenario_digest(&app, &actors, &faults, &initial_world);
-        let mut schedules = Vec::new();
-        enumerate_choices(
-            actors.len(),
-            &mut Vec::new(),
-            &mut schedules,
-            self.max_schedules,
-        );
-        let truncated = schedules.len() == self.max_schedules
-            && factorial_saturating(actors.len()) > self.max_schedules;
+        let mut pending = vec![Vec::new()];
+        let mut visited = BTreeSet::new();
         let mut report = ExploreReport {
             explored: 0,
-            truncated,
+            truncated: false,
             first_failure: None,
         };
-        for choices in schedules {
-            let replay = ReplayToken {
-                schema: REPLAY_SCHEMA,
-                scenario_digest: digest,
-                choices,
-            };
-            report.explored += 1;
-            if let Err(error) = Simulation::new(
+        while let Some(prefix) = pending.pop() {
+            if report.explored == self.max_schedules {
+                report.truncated = true;
+                break;
+            }
+            let result = Simulation::new(
                 app.clone(),
                 actors.clone(),
                 faults.clone(),
                 initial_world.clone(),
-                Schedule::Replay(replay.clone()),
+                Schedule::ExplorePrefix(prefix),
             )
-            .run()
-            {
-                report.first_failure = Some(ExploreFailure {
-                    message: error.to_string(),
-                    replay,
-                });
-                break;
+            .run();
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let replay = ReplayToken {
+                        schema: REPLAY_SCHEMA,
+                        scenario_digest: digest,
+                        choices: Vec::new(),
+                    };
+                    report.first_failure = Some(ExploreFailure {
+                        message: error.to_string(),
+                        replay,
+                    });
+                    break;
+                }
+            };
+            let choices = result.replay.choices.clone();
+            if !visited.insert(choices.clone()) {
+                continue;
+            }
+            report.explored += 1;
+            for (position, width) in result.schedule_widths.iter().copied().enumerate().rev() {
+                for alternative in (0..width).rev() {
+                    if choices[position] == alternative {
+                        continue;
+                    }
+                    let mut branch = choices[..position].to_vec();
+                    branch.push(alternative);
+                    pending.push(branch);
+                }
             }
         }
         Ok(report)
@@ -604,33 +620,6 @@ impl ExploreReport {
     }
 }
 
-fn enumerate_choices(
-    remaining: usize,
-    prefix: &mut Vec<usize>,
-    output: &mut Vec<Vec<usize>>,
-    limit: usize,
-) {
-    if output.len() >= limit {
-        return;
-    }
-    if remaining == 0 {
-        output.push(prefix.clone());
-        return;
-    }
-    for choice in 0..remaining {
-        prefix.push(choice);
-        enumerate_choices(remaining - 1, prefix, output, limit);
-        prefix.pop();
-        if output.len() >= limit {
-            return;
-        }
-    }
-}
-
-fn factorial_saturating(value: usize) -> usize {
-    (1..=value).fold(1, usize::saturating_mul)
-}
-
 pub struct Simulation {
     app: AppId,
     actors: Vec<Actor>,
@@ -654,28 +643,37 @@ impl Simulation {
             schedule,
         }
     }
-    pub fn run(mut self) -> Result<SimResult, SimError> {
+    pub fn run(self) -> Result<SimResult, SimError> {
         let digest = scenario_digest(&self.app, &self.actors, &self.faults, &self.initial_world);
-        let choices = schedule_choices(&self.schedule, digest, self.actors.len())?;
+        let mut scheduler = ScheduleCursor::new(self.schedule, digest)?;
         let mut world = self.initial_world;
         let mut trace = Vec::new();
         let mut outcomes = BTreeMap::new();
         let mut fault_runtime = FaultRuntime::new(self.faults);
-        let mut remaining: Vec<Actor> = self.actors.drain(..).collect();
-        for choice in &choices {
-            let actor = remaining.remove(*choice % remaining.len());
-            trace.push(SimEvent::ActorScheduled {
-                actor: actor.name.clone(),
-            });
-            apply(
-                &actor,
-                &mut world,
-                &mut trace,
-                &mut outcomes,
-                &mut fault_runtime,
-            )?;
+        let mut actors: Vec<RuntimeActor> = self
+            .actors
+            .into_iter()
+            .map(|actor| RuntimeActor {
+                actor,
+                phase: ActorPhase::RequestLock,
+            })
+            .collect();
+        while actors.iter().any(|actor| actor.phase != ActorPhase::Done) {
+            let runnable: Vec<usize> = actors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, actor)| actor.runnable(&world).then_some(index))
+                .collect();
+            if runnable.is_empty() {
+                return Err(SimError::Deadlock);
+            }
+            let selected = runnable[scheduler.choose(runnable.len())?];
+            let actor_name = actors[selected].actor.name.clone();
+            trace.push(SimEvent::ActorScheduled { actor: actor_name });
+            actors[selected].step(&mut world, &mut trace, &mut outcomes, &mut fault_runtime)?;
             check_invariants(&world, &mut trace)?;
         }
+        let (choices, schedule_widths) = scheduler.finish()?;
         Ok(SimResult {
             world,
             outcomes,
@@ -685,36 +683,304 @@ impl Simulation {
                 scenario_digest: digest,
                 choices,
             },
+            schedule_widths,
         })
     }
 }
 
-fn schedule_choices(
-    schedule: &Schedule,
-    digest: [u8; 32],
-    count: usize,
-) -> Result<Vec<usize>, SimError> {
-    match schedule {
-        Schedule::Fifo => Ok(vec![0; count]),
-        Schedule::Seeded(mut seed) => Ok((0..count)
-            .map(|left| {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                (seed as usize) % (count - left)
-            })
-            .collect()),
-        Schedule::Replay(token) if token.schema != REPLAY_SCHEMA => Err(SimError::ReplaySchema {
-            expected: REPLAY_SCHEMA,
-            observed: token.schema,
-        }),
-        Schedule::Replay(token) if token.scenario_digest != digest => {
-            Err(SimError::ReplayScenarioMismatch)
+enum ScheduleCursor {
+    Fifo {
+        choices: Vec<usize>,
+    },
+    Seeded {
+        state: u64,
+        choices: Vec<usize>,
+    },
+    Replay {
+        choices: Vec<usize>,
+        position: usize,
+    },
+    Explore {
+        prefix: Vec<usize>,
+        position: usize,
+        choices: Vec<usize>,
+        widths: Vec<usize>,
+    },
+}
+
+impl ScheduleCursor {
+    fn new(schedule: Schedule, digest: [u8; 32]) -> Result<Self, SimError> {
+        match schedule {
+            Schedule::Fifo => Ok(Self::Fifo {
+                choices: Vec::new(),
+            }),
+            Schedule::Seeded(seed) => Ok(Self::Seeded {
+                state: seed,
+                choices: Vec::new(),
+            }),
+            Schedule::Replay(token) if token.schema != REPLAY_SCHEMA => {
+                Err(SimError::ReplaySchema {
+                    expected: REPLAY_SCHEMA,
+                    observed: token.schema,
+                })
+            }
+            Schedule::Replay(token) if token.scenario_digest != digest => {
+                Err(SimError::ReplayScenarioMismatch)
+            }
+            Schedule::Replay(token) => Ok(Self::Replay {
+                choices: token.choices,
+                position: 0,
+            }),
+            Schedule::ExplorePrefix(prefix) => Ok(Self::Explore {
+                prefix,
+                position: 0,
+                choices: Vec::new(),
+                widths: Vec::new(),
+            }),
         }
-        Schedule::Replay(token) if token.choices.len() != count => {
-            Err(SimError::ReplayScenarioMismatch)
+    }
+
+    fn choose(&mut self, runnable: usize) -> Result<usize, SimError> {
+        let choice = match self {
+            Self::Fifo { .. } => 0,
+            Self::Seeded { state, .. } => {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                (*state as usize) % runnable
+            }
+            Self::Replay { choices, position } => {
+                let choice = *choices
+                    .get(*position)
+                    .ok_or(SimError::ReplayScenarioMismatch)?;
+                *position += 1;
+                if choice >= runnable {
+                    return Err(SimError::ReplayScenarioMismatch);
+                }
+                choice
+            }
+            Self::Explore {
+                prefix, position, ..
+            } => {
+                let choice = prefix.get(*position).copied().unwrap_or(0);
+                *position += 1;
+                if choice >= runnable {
+                    return Err(SimError::ReplayScenarioMismatch);
+                }
+                choice
+            }
+        };
+        match self {
+            Self::Fifo { choices } | Self::Seeded { choices, .. } => choices.push(choice),
+            Self::Replay { .. } => {}
+            Self::Explore {
+                choices, widths, ..
+            } => {
+                choices.push(choice);
+                widths.push(runnable);
+            }
         }
-        Schedule::Replay(token) => Ok(token.choices.clone()),
+        Ok(choice)
+    }
+
+    fn finish(self) -> Result<(Vec<usize>, Vec<usize>), SimError> {
+        match self {
+            Self::Fifo { choices } | Self::Seeded { choices, .. } => Ok((choices, Vec::new())),
+            Self::Replay { choices, position } if position == choices.len() => {
+                Ok((choices, Vec::new()))
+            }
+            Self::Replay { .. } => Err(SimError::ReplayScenarioMismatch),
+            Self::Explore {
+                prefix,
+                position,
+                choices,
+                widths,
+            } if position >= prefix.len() => Ok((choices, widths)),
+            Self::Explore { .. } => Err(SimError::ReplayScenarioMismatch),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActorPhase {
+    RequestLock,
+    AcquireLock,
+    Ensure {
+        stage: u8,
+        generation: Option<GenerationId>,
+    },
+    Atomic,
+    ReleaseLock,
+    Done,
+}
+
+struct RuntimeActor {
+    actor: Actor,
+    phase: ActorPhase,
+}
+
+impl RuntimeActor {
+    fn runnable(&self, world: &World) -> bool {
+        match self.phase {
+            ActorPhase::RequestLock => true,
+            ActorPhase::AcquireLock => world.lock_owners.is_empty(),
+            ActorPhase::Ensure { .. } | ActorPhase::Atomic | ActorPhase::ReleaseLock => {
+                world.lock_owners.contains(&self.actor.name)
+            }
+            ActorPhase::Done => false,
+        }
+    }
+
+    fn step(
+        &mut self,
+        world: &mut World,
+        trace: &mut Vec<SimEvent>,
+        outcomes: &mut BTreeMap<String, OperationOutcome>,
+        faults: &mut FaultRuntime,
+    ) -> Result<(), SimError> {
+        match self.phase {
+            ActorPhase::RequestLock => {
+                trace.push(SimEvent::LifecycleLockRequested {
+                    actor: self.actor.name.clone(),
+                });
+                self.phase = ActorPhase::AcquireLock;
+            }
+            ActorPhase::AcquireLock => {
+                world.lock_owners.insert(self.actor.name.clone());
+                trace.push(SimEvent::LifecycleLockAcquired {
+                    actor: self.actor.name.clone(),
+                });
+                self.phase = if self.actor.action == ClientAction::Ensure {
+                    ActorPhase::Ensure {
+                        stage: 0,
+                        generation: None,
+                    }
+                } else {
+                    ActorPhase::Atomic
+                };
+            }
+            ActorPhase::Ensure { stage, generation } => {
+                self.step_ensure(stage, generation, world, trace, outcomes, faults)?
+            }
+            ActorPhase::Atomic => {
+                apply(&self.actor, world, trace, outcomes, faults, true)?;
+                self.phase = ActorPhase::Done;
+            }
+            ActorPhase::ReleaseLock => {
+                world.lock_owners.remove(&self.actor.name);
+                self.phase = ActorPhase::Done;
+            }
+            ActorPhase::Done => unreachable!("done actors are not runnable"),
+        }
+        Ok(())
+    }
+
+    fn step_ensure(
+        &mut self,
+        stage: u8,
+        generation: Option<GenerationId>,
+        world: &mut World,
+        trace: &mut Vec<SimEvent>,
+        outcomes: &mut BTreeMap<String, OperationOutcome>,
+        faults: &mut FaultRuntime,
+    ) -> Result<(), SimError> {
+        let mut fail = |point: FaultPoint,
+                        world: &mut World,
+                        trace: &mut Vec<SimEvent>|
+         -> Result<bool, SimError> {
+            if faults.trigger(point, trace).is_some() {
+                rollback_start(world, trace)?;
+                outcomes.insert(self.actor.name.clone(), OperationOutcome::Faulted(point));
+                self.phase = ActorPhase::ReleaseLock;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        };
+        match stage {
+            0 if world.state == Some(LifecycleState::Ready) => {
+                outcomes.insert(
+                    self.actor.name.clone(),
+                    OperationOutcome::Generation(world.generation.unwrap()),
+                );
+                self.phase = ActorPhase::ReleaseLock;
+            }
+            0 => {
+                transition(world, trace, LifecycleState::Preparing)?;
+                self.phase = ActorPhase::Ensure {
+                    stage: 1,
+                    generation: None,
+                };
+            }
+            1 => {
+                let value = GenerationId(world.next_generation);
+                world.next_generation += 1;
+                if !fail(FaultPoint::AfterGenerationCreated, world, trace)? {
+                    world.generation = Some(value);
+                    self.phase = ActorPhase::Ensure {
+                        stage: 2,
+                        generation: Some(value),
+                    };
+                }
+            }
+            2 => {
+                let value = generation.expect("generation assigned");
+                world.leases.insert(value);
+                if !fail(FaultPoint::AfterChildSpawned, world, trace)? {
+                    trace.push(SimEvent::LeaseAcquired { generation: value });
+                    self.phase = ActorPhase::Ensure {
+                        stage: 3,
+                        generation,
+                    };
+                }
+            }
+            3 => {
+                let value = generation.expect("generation assigned");
+                trace.push(SimEvent::BootstrapPrepared { generation: value });
+                if !fail(FaultPoint::AfterBootstrapPrepared, world, trace)? {
+                    self.phase = ActorPhase::Ensure {
+                        stage: 4,
+                        generation,
+                    };
+                }
+            }
+            4 => {
+                transition(world, trace, LifecycleState::Published)?;
+                self.phase = ActorPhase::Ensure {
+                    stage: 5,
+                    generation,
+                };
+            }
+            5 => {
+                let value = generation.expect("generation assigned");
+                world.manifest = Some(value);
+                trace.push(SimEvent::ManifestPublished { generation: value });
+                if !fail(FaultPoint::AfterManifestPublish, world, trace)? {
+                    self.phase = ActorPhase::Ensure {
+                        stage: 6,
+                        generation,
+                    };
+                }
+            }
+            6 => {
+                let value = generation.expect("generation assigned");
+                world.committed = true;
+                trace.push(SimEvent::CommitSent { generation: value });
+                self.phase = ActorPhase::Ensure {
+                    stage: 7,
+                    generation,
+                };
+            }
+            7 => {
+                let value = generation.expect("generation assigned");
+                transition(world, trace, LifecycleState::Ready)?;
+                world.ready_generations.insert(value);
+                outcomes.insert(self.actor.name.clone(), OperationOutcome::Generation(value));
+                self.phase = ActorPhase::ReleaseLock;
+            }
+            _ => unreachable!("invalid ensure stage"),
+        }
+        Ok(())
     }
 }
 
@@ -779,17 +1045,20 @@ fn apply(
     trace: &mut Vec<SimEvent>,
     outcomes: &mut BTreeMap<String, OperationOutcome>,
     faults: &mut FaultRuntime,
+    lock_already_held: bool,
 ) -> Result<(), SimError> {
-    trace.push(SimEvent::LifecycleLockRequested {
-        actor: actor.name.clone(),
-    });
-    world.lock_owners.insert(actor.name.clone());
-    if world.lock_owners.len() > 1 {
-        return Err(SimError::Invariant(InvariantId::ExclusiveLifecycleLock));
+    if !lock_already_held {
+        trace.push(SimEvent::LifecycleLockRequested {
+            actor: actor.name.clone(),
+        });
+        world.lock_owners.insert(actor.name.clone());
+        if world.lock_owners.len() > 1 {
+            return Err(SimError::Invariant(InvariantId::ExclusiveLifecycleLock));
+        }
+        trace.push(SimEvent::LifecycleLockAcquired {
+            actor: actor.name.clone(),
+        });
     }
-    trace.push(SimEvent::LifecycleLockAcquired {
-        actor: actor.name.clone(),
-    });
     let outcome = match actor.action {
         ClientAction::Ensure => {
             if world.state == Some(LifecycleState::Ready) {
@@ -941,6 +1210,7 @@ pub struct SimResult {
     outcomes: BTreeMap<String, OperationOutcome>,
     trace: Trace,
     replay: ReplayToken,
+    schedule_widths: Vec<usize>,
 }
 impl SimResult {
     pub fn assert_invariants(&self) -> Result<(), SimError> {
@@ -986,6 +1256,8 @@ pub enum SimError {
     TimeOverflow,
     #[error("explorer requires at least one schedule")]
     InvalidExplorerBound,
+    #[error("simulation has unfinished actors but no runnable transition")]
+    Deadlock,
 }
 impl SimError {
     fn serialization(error: impl std::fmt::Display) -> Self {
@@ -1231,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn explorer_covers_the_hand_enumerated_actor_order_space() {
+    fn explorer_covers_the_hand_enumerated_transition_space() {
         let report = Scenario::embedded("com.example.worker")
             .unwrap()
             .client("a", ClientAction::status())
@@ -1239,7 +1511,10 @@ mod tests {
             .client("c", ClientAction::status())
             .explore(Explorer::new())
             .unwrap();
-        assert_eq!(report.explored_schedules(), 6);
+        // Three status actors each request, acquire, and execute under one
+        // modeled lifecycle lock. Enumerating the runnable transition choices
+        // yields 168 distinct schedules after identical prefixes are pruned.
+        assert_eq!(report.explored_schedules(), 168);
         assert!(!report.was_truncated());
         assert!(report.first_failure().is_none());
     }
@@ -1255,6 +1530,34 @@ mod tests {
             .unwrap();
         assert_eq!(report.explored_schedules(), 2);
         assert!(report.was_truncated());
+    }
+
+    #[test]
+    fn seeded_scheduler_can_interleave_waiter_requests_during_startup() {
+        let result = (1..100)
+            .find_map(|seed| {
+                let result = Scenario::embedded("com.example.worker")
+                    .unwrap()
+                    .client("first", ClientAction::ensure())
+                    .client("second", ClientAction::ensure())
+                    .schedule(Schedule::Seeded(seed))
+                    .run()
+                    .unwrap();
+                let second_request = result.trace().events().iter().position(|event| {
+                    matches!(event, SimEvent::LifecycleLockRequested { actor } if actor == "second")
+                })?;
+                let commit = result
+                    .trace()
+                    .events()
+                    .iter()
+                    .position(|event| matches!(event, SimEvent::CommitSent { .. }))?;
+                (second_request < commit).then_some(result)
+            })
+            .expect("at least one seed interleaves the waiting caller");
+        assert_eq!(
+            result.generation("first").unwrap(),
+            result.generation("second").unwrap()
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ testkit = []
 
 [dependencies]
 futures-core.workspace = true
+fs2.workspace = true
 serde.workspace = true
 semver.workspace = true
 sha2.workspace = true
@@ -27,5 +28,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 trybuild = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

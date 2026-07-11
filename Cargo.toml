@@ -12,6 +12,7 @@ repository = "https://github.com/akiselev/daemonkit"
 [workspace.dependencies]
 daemonkit = { path = "daemonkit", version = "0.1.0", default-features = false }
 futures-core = "0.3"
+fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
@@ -19,3 +20,4 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["io-util", "rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.10", features = ["serde", "v4"] }
+tempfile = "3.12"

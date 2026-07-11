@@ -1,7 +1,7 @@
 # Status
 
-Phase 0 is in progress. The workspace and first executable model slice exist;
-native lifecycle behavior has not started.
+Phase 0's executable foundation and exit-gate model are in place. Native
+lifecycle behavior has not started; Phase 1 red scenarios are next.
 
 ## Latest
 
@@ -50,12 +50,17 @@ native lifecycle behavior has not started.
 - Completed the spec policy skeleton with drain timeout, bounded log retention,
   explicit runtime roots, native/custom transport selection, and OS file-object
   `PathKey` identity (Unix device/inode; Windows volume serial/file index).
-- Current gates pass: 26 unit tests, seven compile API cases, one doctest,
+- Refactored simulation from whole-operation ordering to explicit lifecycle
+  transition scheduling: request/acquire lock, prepare, generation, lease,
+  bootstrap, publish, commit, ready, and release. Invariants run after every
+  transition, seeded runs interleave waiters and replay exactly, and bounded DFS
+  explores/prunes transition schedules (168 for the three-actor contract case).
+- Current gates pass: 27 unit tests, seven compile API cases, one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Finish Phase 0 by changing the scheduler from whole-operation ordering to
-documented backend-transition yield points and add custom actor/spec support.
-Then begin Phase 1 with red secure-root, stable-lock, interrupted-publication,
-and corrupt-record scenarios before native implementations.
+Begin Phase 1 with red secure-root, stable-lock, interrupted-publication, and
+corrupt-record scenarios; then implement native identity/root/lock/store
+contracts on Unix and Windows. Extend custom actor/spec testkit composition as
+the first downstream contract needs it.

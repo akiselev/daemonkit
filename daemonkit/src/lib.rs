@@ -16,6 +16,8 @@ mod facade;
 mod identity;
 mod model;
 #[allow(dead_code)]
+mod native;
+#[allow(dead_code)]
 mod protocol;
 #[allow(dead_code)]
 mod record;
