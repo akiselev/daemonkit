@@ -1,0 +1,31 @@
+[package]
+name = "daemonkit"
+description = "Secure, cross-platform local daemon lifecycle runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["runtime-tokio", "native-transport", "native-process"]
+runtime-tokio = ["dep:tokio"]
+native-transport = []
+native-process = []
+blocking = ["runtime-tokio"]
+advanced = []
+testkit = []
+
+[dependencies]
+futures-core.workspace = true
+serde.workspace = true
+semver.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+trybuild = "1.0"

@@ -1,0 +1,5 @@
+error[E0599]: no method named `ensure` found for struct `DaemonClient<M, P>` in the current scope
+ --> tests/ui/client_no_ensure.rs:4:20
+  |
+4 |     let _ = client.ensure().await;
+  |                    ^^^^^^ method not found in `DaemonClient<Embedded>`

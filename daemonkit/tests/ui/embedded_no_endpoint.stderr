@@ -1,0 +1,5 @@
+error[E0599]: no method named `service_endpoint` found for struct `daemonkit::Instance<Embedded>` in the current scope
+ --> tests/ui/embedded_no_endpoint.rs:4:22
+  |
+4 |     let _ = instance.service_endpoint();
+  |                      ^^^^^^^^^^^^^^^^ private field, not a method
