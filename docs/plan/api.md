@@ -28,12 +28,21 @@ daemonkit
   diagnostics    startup phase, log paths, captured tails
   blocking       synchronous facade                    [feature = "blocking"]
   advanced       Platform and object-safe adapters     [feature = "advanced"]
-  test_support   isolated roots and fault injection    [feature = "test-support"]
+  __testkit      sealed SimPlatform hooks               [feature = "testkit"]
+
+daemonkit-testkit
+  scenario       ergonomic embedded/managed scenario DSL
+  simulation     deterministic world, scheduler, faults, and replay
+  contracts      reusable backend conformance suites
+  fixtures       embedded and managed consumer-shaped fixtures
 ```
 
 Default features include the Tokio runtime, native local transport, and the
 platform process backend. The initial MSRV is recorded in `Cargo.toml` and CI;
-the implementation must not accidentally raise it.
+the implementation must not accidentally raise it. The `testkit` feature is
+enabled by `daemonkit-testkit`, is excluded from default/production builds, and
+is not intended for direct use. The public testing API lives in the companion
+crate; see [`testkit.md`](testkit.md).
 
 ## The happy paths
 
@@ -525,7 +534,7 @@ downstream crates customize v1 through the object-safe adapters rather than by
 implementing the platform bundle. Implementation traits with GAT guards or
 store transactions remain private until multiple real backends prove a stable
 downstream contract. The generic bundle still prevents backend parameters from
-spreading through the kernel and permits a deterministic `TestPlatform`. The
+spreading through the kernel and permits a deterministic `SimPlatform`. The
 default platform is Tokio-based; v1 does not claim executor independence.
 
 ## Blocking facade

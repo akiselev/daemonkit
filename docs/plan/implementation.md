@@ -19,6 +19,12 @@ The kernel is independent of Tokio types where practical. Async orchestration,
 signals, local sockets/pipes, and process I/O use Tokio through
 `DefaultPlatform`; v1 does not build a general runtime abstraction.
 
+The workspace contains `daemonkit` and `daemonkit-testkit`. The low-level
+simulator platform lives feature-gated in daemonkit so it can implement the
+sealed platform contract without a circular dependency; the companion crate
+owns the public scenario, scheduling, exploration, invariant, trace, fixture,
+and backend-contract APIs described in [`testkit.md`](testkit.md).
+
 ## On-disk layout
 
 ```text
@@ -213,25 +219,34 @@ retain original bytes.
 
 ## Build phases
 
-Each phase lands only with its tests, docs, and a runnable fixture. Later phases
-must not weaken earlier invariants.
+Each phase lands only through the red/green sequence in `testkit.md`: failing
+focused scenario, failing unsafe interleaving/invariant where applicable, green
+kernel, green backend contract, then green native platform coverage. Later
+phases must not weaken earlier invariants.
 
-### Phase 0: API and protocol skeleton
+### Phase 0: workspace, testkit, API, and protocol skeleton
 
-- Create the crate, feature layout, MSRV policy, rustdoc landing page, and public
-  types from `api.md`.
+- Create the two-crate workspace, feature layout, shared MSRV/version policy,
+  rustdoc landing pages, and public types from `api.md` and `testkit.md`.
 - Add compile-only examples for embedded, managed, attach-only, blocking, and
-  custom-transport use, plus internal `TestPlatform` coverage.
+  custom-transport use.
 - Define internal state transitions, protocol messages, record schema, error
   taxonomy, redaction wrappers, and fault points.
-- Add `DefaultPlatform` interfaces with fake implementations; no real spawn yet.
+- Implement the deterministic clock, entropy, scheduler, event trace, world
+  model, `SimPlatform`, replay token, and default invariant engine before native
+  spawning.
+- Add the first public scenario DSL examples and simulator self-tests.
 
 Exit gate: public examples infer cleanly, compile-fail mode tests pass, and a
-pure model can execute every legal transition and reject illegal ones.
+pure model can execute every legal transition, reject illegal ones, replay a
+seeded schedule exactly, and demonstrate every default invariant failing in a
+negative test.
 
 ### Phase 1: identity, roots, locks, and store
 
 - Implement validation and domain-separated key hashing.
+- Write red scenarios for alias policy, unsafe roots, concurrent lock ownership,
+  interrupted atomic publication, and corrupt records.
 - Implement secure roots and stable lifecycle/lease locks on all platforms.
 - Implement atomic records, corruption handling, generation directories, and
   retention.
@@ -244,6 +259,8 @@ record on Linux, macOS, or Windows.
 ### Phase 2: native transport and authenticated control
 
 - Implement UDS and secured Windows named pipes.
+- Write red scenarios for partial I/O, endpoint squatting/reuse, handshake
+  mismatch, slow authentication, and application-stream handoff.
 - Implement bounded framing, handshake, capabilities, control state, and
   application stream handoff.
 - Implement custom object-safe transport adaptation behind `advanced` without
@@ -258,6 +275,8 @@ all platforms.
 - Implement inherited one-shot bootstrap channel, controlled spawn/detachment,
   prepared/publish/commit, cancellation cleanup, compatibility, and stale
   repair.
+- Explore bounded prepare/publish/commit schedules and retain replay cases for
+  every discovered failure before implementing the native path.
 - Implement embedded service trait/closure, drain, shutdown, idle timeout,
   diagnostics, and blocking parent facade.
 - Stress concurrent ensure/restart/stop using real processes.
@@ -269,6 +288,8 @@ fixture never creates two discoverable generations or loses startup output.
 
 - Implement command safety, readiness probes, endpoint publication, concurrent
   output capture, graceful shutdown ladders, and process-tree ownership.
+- Model readiness/output/exit and drain/terminate/kill interleavings first;
+  preserve minimized failing schedules as regressions.
 - Implement Unix groups/supervisor behavior and Windows Job Objects.
 - Add JVM-like wrapper/grandchild fixtures that reproduce inherited-pipe and
   orphan-tree failures.

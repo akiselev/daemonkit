@@ -3,14 +3,17 @@
 daemon lifecycle correctness is primarily a concurrency, crash-consistency,
 security, and operating-system semantics problem. Unit tests are necessary but
 cannot substitute for real multi-process tests on every supported platform.
+Deterministic lifecycle development and schedule exploration live in the
+first-class `daemonkit-testkit` crate described in [`testkit.md`](testkit.md).
 
 ## Test layers
 
-1. Pure model tests enumerate legal lifecycle transitions and policy outcomes.
+1. `daemonkit-testkit` scenarios and bounded exploration enumerate lifecycle
+   transitions, interleavings, faults, and policy outcomes.
 2. Unit tests cover parsing, validation, hashing, framing, redaction, and error
    construction.
-3. Backend contract suites run against fake and native lock/store/transport/
-   process implementations.
+3. Testkit backend contract suites run against `SimPlatform` and native
+   lock/store/transport/process implementations.
 4. Multi-process fixture tests exercise actual locks, spawn, IPC, signals,
    handles, logs, and crashes.
 5. Consumer-shaped fixtures exercise debugger-cli embedded mode and ghidra-cli
@@ -22,9 +25,12 @@ Every test receives a random isolated runtime root. Concurrency tests must not
 use a global serial lock. Test cleanup reports leaked processes and artifacts as
 failures rather than silently removing the evidence first.
 
-## Deterministic fault injection
+## Deterministic simulation and fault injection
 
-The kernel exposes internal/test-support failpoints at:
+The testkit schedules named actors against virtual time, storage, locks,
+processes, and transport. It checks the default safety invariants after every
+transition, explores bounded schedules, and emits a replay token for every
+failure. The kernel exposes feature-gated semantic failpoints at:
 
 - before and after lifecycle lock acquisition;
 - after reading an existing record;
@@ -44,7 +50,9 @@ The kernel exposes internal/test-support failpoints at:
 
 Each failpoint can return an error, pause behind a barrier, abort the launcher,
 abort the daemon, or simulate I/O cancellation as appropriate. The harness
-records a phase trace so a timeout identifies the blocked transition.
+records a structured phase trace so a timeout identifies the blocked
+transition. Failures are first reproduced in simulation, then covered by the
+relevant native regression; simulation does not replace OS validation.
 
 ## Required lifecycle scenarios
 
@@ -186,6 +194,9 @@ out.
 Required pull-request jobs:
 
 - stable Rust format, lint, docs, unit, doctest, and compile-fail checks;
+- daemonkit-testkit self-tests, focused FIFO/replay scenarios, and default
+  invariant mutation tests;
+- bounded schedule exploration with failure replay tokens retained as artifacts;
 - MSRV build and supported-feature combinations;
 - Linux real-process and stress suite;
 - macOS real-process and platform suite;

@@ -10,6 +10,8 @@ The plan is split into:
 - [`api.md`](api.md): the public contract and ergonomic examples;
 - [`implementation.md`](implementation.md): internal invariants, components,
   phases, and deliverables;
+- [`testkit.md`](testkit.md): the first-class deterministic simulator, scenario
+  API, invariant engine, and red/green workflow;
 - [`testing.md`](testing.md): the cross-platform verification and fault matrix.
 
 The notes remain design inputs. When a sketch in the notes conflicts with this
@@ -80,7 +82,9 @@ misleading on Windows. The executable constructs the service after
 
 Included:
 
-- one Rust crate with `async` as the primary API and a `blocking` facade;
+- a two-crate workspace: `daemonkit` plus the publishable
+  `daemonkit-testkit` dev dependency;
+- an `async` primary API and a `blocking` facade;
 - Tokio as the only executor integration;
 - global, string, UUID, and explicit path keys;
 - filesystem Unix-domain control sockets on Unix;
@@ -90,7 +94,9 @@ Included:
 - atomic JSON instance records and retained generation logs;
 - compatibility checks and restart/error mismatch actions;
 - Unix session/process-group handling and Windows Job Objects;
-- public test support for isolated roots and deterministic fault injection;
+- deterministic simulation, schedule exploration, replayable traces, invariant
+  checking, isolated native roots, and fault injection through
+  `daemonkit-testkit`;
 - CI and platform tests on Linux, macOS, and Windows.
 
 Explicitly deferred until the lifecycle protocol is stable:
@@ -130,7 +136,10 @@ v1 is complete only when:
 
 - the API examples in `api.md` compile as documentation tests;
 - every lifecycle transition has a durable invariant test;
+- every implementation slice begins with a failing deterministic scenario and
+  finishes with simulation, backend-contract, and affected-platform tests green;
 - the interruption matrix in `testing.md` passes deterministically;
+- seeded simulation failures replay exactly from their emitted replay token;
 - real process tests pass on Linux, macOS, and Windows CI runners;
 - sanitizer/loom-style model tests cover in-process synchronization where
   applicable, without replacing real multi-process tests;
