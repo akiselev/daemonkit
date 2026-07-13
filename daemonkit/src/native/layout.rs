@@ -12,7 +12,6 @@ use super::{root::VerifiedRoot, store::AtomicStore};
 /// Human-readable key metadata never participates in these paths.
 #[derive(Clone, Debug)]
 pub(crate) struct InstanceLayout {
-    root: PathBuf,
     directory: PathBuf,
 }
 
@@ -26,14 +25,16 @@ impl InstanceLayout {
         root.reverify().map_err(LayoutError::Root)?;
         let directory = root
             .path()
-            .join(hex(&app_digest))
-            .join(hex(&key_digest.0))
-            .join(hex(&isolation_digest));
+            // Full digests remain in the record and are authenticated before
+            // use.  The filesystem hierarchy only needs a collision-resistant
+            // routing prefix.  Keeping 128 bits per component avoids Windows'
+            // legacy Win32 path limit once the atomic store adds its temporary
+            // filename, while making an accidental collision infeasible.
+            .join(directory_component(&app_digest))
+            .join(directory_component(&key_digest.0))
+            .join(directory_component(&isolation_digest));
         create_private_tree(root.path(), &directory)?;
-        Ok(Self {
-            root: root.path().to_owned(),
-            directory,
-        })
+        Ok(Self { directory })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -46,8 +47,12 @@ impl InstanceLayout {
         instance: &crate::InstanceId,
         generation: GenerationId,
     ) -> Result<PathBuf, LayoutError> {
-        let sockets = self.root.join("s");
-        create_private(&sockets)?;
+        // A caller-controlled runtime root may be much too deep for macOS's
+        // `sockaddr_un`.  Put the socket in a separate, user-private, fixed
+        // short directory.  The endpoint is still generation-specific and
+        // the handshake checks the complete identity plus its random token,
+        // so shortening this path never broadens authority.
+        let sockets = short_socket_directory()?;
         Ok(sockets.join(format!(
             "{}-{:016x}.sock",
             hex(&instance.0[..8]),
@@ -161,6 +166,31 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
+fn directory_component(digest: &[u8; 32]) -> String {
+    hex(&digest[..16])
+}
+
+#[cfg(unix)]
+fn short_socket_directory() -> Result<PathBuf, LayoutError> {
+    use std::os::unix::fs::MetadataExt;
+
+    // `/tmp` itself is intentionally world writable, but this child is
+    // created as 0700 and verified on every use.  It is deliberately not
+    // derived from `temp_dir()`: macOS commonly points that variable at a
+    // long per-user path which cannot host a portable Unix socket pathname.
+    let path = PathBuf::from(format!("/tmp/daemonkit-{}", unsafe { libc::geteuid() }));
+    create_private(&path)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(LayoutError::UnsafeEntry { path });
+    }
+    Ok(path)
+}
+
 fn create_private_tree(root: &Path, target: &Path) -> Result<(), LayoutError> {
     let relative = target
         .strip_prefix(root)
@@ -259,7 +289,7 @@ mod tests {
     fn creates_digest_only_layout_and_stable_authority_paths() {
         let (_parent, layout) = layout();
         assert!(layout.path().is_dir());
-        assert_eq!(layout.path().file_name().unwrap().len(), 64);
+        assert_eq!(layout.path().file_name().unwrap().len(), 32);
         assert!(layout
             .lifecycle_lock()
             .acquire(std::time::Duration::from_secs(1))
@@ -269,6 +299,31 @@ mod tests {
             .acquire(std::time::Duration::from_secs(1))
             .is_ok());
         assert!(layout.record_store().read().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_endpoint_remains_portable_for_a_deep_runtime_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = RuntimeRoot::new(
+            parent
+                .path()
+                .join("deep-runtime-root-component-00000001")
+                .join("deep-runtime-root-component-00000002")
+                .join("deep-runtime-root-component-00000003")
+                .join("runtime"),
+        )
+        .unwrap();
+        let root = VerifiedRoot::open(Some(&root)).unwrap();
+        let layout = InstanceLayout::create(&root, [1; 32], KeyDigest([2; 32]), [3; 32]).unwrap();
+        let endpoint = layout
+            .control_endpoint_path(&crate::InstanceId([7; 32]), GenerationId(8))
+            .unwrap();
+        assert!(endpoint.as_os_str().as_encoded_bytes().len() <= 100);
+        assert!(endpoint
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| name.to_string_lossy().starts_with("daemonkit-")));
     }
 
     #[test]
