@@ -1,7 +1,7 @@
 # Status
 
 Phases 0-4 are implemented. The native runtime now covers embedded daemons and
-supervised managed children; Phase 5 hardening and consumer spikes are next.
+supervised managed children; the cross-platform CI matrix is active and passing.
 
 ## Implemented
 
@@ -32,11 +32,17 @@ supervised managed children; Phase 5 hardening and consumer spikes are next.
 
 ## Verification
 
-- Local Linux: 69 unit/integration tests, seven compile API cases, one doctest,
-  rustfmt, strict Clippy, rustdoc, and `git diff --check` pass.
-- Cross-compilation: `x86_64-apple-darwin` and `x86_64-pc-windows-gnu` pass with
-  all features. Native macOS/Windows execution remains CI evidence; it cannot be
-  run from this Linux host.
+- Local Linux: native lifecycle (14 real-process cases), layout/path-limit
+  regression, rustfmt, strict Clippy, rustdoc, MSRV 1.81 library check, and
+  `git diff --check` pass.
+- Hosted GitHub Actions: Ubuntu, macOS, and Windows all execute platform
+  storage/security/transport/protocol contracts plus real embedded and managed
+  lifecycle suites. The matrix also covers six feature configurations, public
+  API compilation, repeated race/cancellation/crash/tree-cleanup stress,
+  package validation, and RustSec audit. Run 29269740920 passed all 15 jobs.
+- Hosted failures improved the runtime: compact 128-bit state-directory routing
+  avoids Windows atomic-store temporary-path limits, while Unix control sockets
+  use a verified short per-user directory so macOS handles deep runtime roots.
 
 ## Next
 
