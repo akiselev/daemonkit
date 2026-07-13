@@ -372,6 +372,19 @@ mod tests {
         verified.reverify().unwrap();
     }
 
+    #[test]
+    fn rejects_a_regular_file_as_runtime_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("runtime");
+        fs::write(&path, b"not-a-directory").unwrap();
+        let root = RuntimeRoot::new(&path).unwrap();
+        assert!(matches!(
+            VerifiedRoot::open(Some(&root)),
+            Err(RootError::Unsafe { .. })
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"not-a-directory");
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_unsafe_permissions_without_repairing_them() {
@@ -405,5 +418,23 @@ mod tests {
             VerifiedRoot::open(Some(&root)),
             Err(RootError::Unsafe { .. })
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_an_inherited_acl_without_repairing_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("runtime");
+        fs::create_dir(&path).unwrap();
+        let root = RuntimeRoot::new(&path).unwrap();
+        assert!(matches!(
+            VerifiedRoot::open(Some(&root)),
+            Err(RootError::Io { source, .. })
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(
+            path.is_dir(),
+            "verification must not replace an unsafe root"
+        );
     }
 }

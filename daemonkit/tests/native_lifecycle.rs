@@ -30,6 +30,7 @@ fn lifecycle_fixture_child() {
             .parse()
             .unwrap();
         let executable = std::env::current_exe().unwrap();
+        let omit_endpoint = std::env::var_os("DAEMONKIT_TEST_OMIT_ENDPOINT").is_some();
         let mut child = ManagedChild::new(executable)
             .args(["--exact", "managed_program_fixture", "--nocapture"])
             .env("DAEMONKIT_TEST_MANAGED_PROGRAM", "1")
@@ -43,9 +44,12 @@ fn lifecycle_fixture_child() {
                 {
                     observed.extend_from_slice(&chunk);
                     if String::from_utf8_lossy(&observed).contains(&format!("READY {endpoint}")) {
-                        return Ok::<_, std::io::Error>(
-                            ReadinessResult::ready().service_endpoint(endpoint),
-                        );
+                        let readiness = if omit_endpoint {
+                            ReadinessResult::ready()
+                        } else {
+                            ReadinessResult::ready().service_endpoint(endpoint)
+                        };
+                        return Ok::<_, std::io::Error>(readiness);
                     }
                 }
                 Err(std::io::Error::new(
@@ -336,6 +340,70 @@ async fn managed_supervisor_crash_still_kills_owned_descendants() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_readiness_endpoint_fails_closed_and_kills_managed_tree() {
+    if Bootstrap::detect().unwrap().is_some() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let root = RuntimeRoot::new(state.path().join("runtime")).unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = reservation.local_addr().unwrap();
+    drop(reservation);
+    let grandchild_pid = state.path().join("failed-readiness-grandchild.pid");
+    let daemon = Daemon::managed(
+        DaemonSpec::new("com.example.managed-missing-endpoint")
+            .unwrap()
+            .runtime_root(root.clone())
+            .startup_timeout(Duration::from_secs(3)),
+        fixture_spawn()
+            .env("DAEMONKIT_TEST_MANAGED", "1")
+            .env("DAEMONKIT_TEST_MANAGED_ENDPOINT", endpoint.to_string())
+            .env("DAEMONKIT_TEST_GRANDCHILD_PID", &grandchild_pid)
+            .env("DAEMONKIT_TEST_OMIT_ENDPOINT", "1"),
+    )
+    .unwrap();
+
+    let error = match daemon.ensure().await {
+        Ok(_) => panic!("missing readiness endpoint unexpectedly published"),
+        Err(error) => error,
+    };
+    assert!(error.startup_diagnostics().is_some());
+    let descendant = wait_for_pid(&grandchild_pid).await;
+    wait_until_process_gone(descendant).await;
+    wait_for_generation_cleanup(root.as_path()).await;
+    assert!(matches!(
+        daemon.status().await.unwrap(),
+        InstanceStatus::Absent
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_timeout_kills_child_and_rolls_back_generation() {
+    let state = tempfile::tempdir().unwrap();
+    let root = RuntimeRoot::new(state.path().join("runtime")).unwrap();
+    let daemon = Daemon::embedded(
+        DaemonSpec::new("com.example.bootstrap-timeout")
+            .unwrap()
+            .runtime_root(root.clone())
+            .startup_timeout(Duration::from_millis(150)),
+        fixture_spawn().env("DAEMONKIT_TEST_BOOTSTRAP_DELAY_MS", "2000"),
+    )
+    .unwrap();
+
+    let error = match daemon.ensure().await {
+        Ok(_) => panic!("delayed bootstrap unexpectedly became ready"),
+        Err(error) => error,
+    };
+    let diagnostics = error.startup_diagnostics().unwrap();
+    assert!(diagnostics.process_id.is_some());
+    wait_for_generation_cleanup(root.as_path()).await;
+    assert!(matches!(
+        daemon.status().await.unwrap(),
+        InstanceStatus::Absent
+    ));
+}
+
 async fn wait_for_pid(path: &std::path::Path) -> u32 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -352,6 +420,16 @@ async fn wait_for_pid(path: &std::path::Path) -> u32 {
 async fn wait_until_process_gone(process_id: u32) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while process_exists(process_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_generation_cleanup(root: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while generation_directory_count(root) != 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -376,7 +454,8 @@ fn process_exists(process_id: u32) -> bool {
         return false;
     }
     let mut code = 0;
-    let active = unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE;
+    let active =
+        unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE as u32;
     unsafe { CloseHandle(handle) };
     active
 }

@@ -3,33 +3,165 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * 1"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
 jobs:
-  test:
-    name: test (${{ matrix.os }})
+  quality:
+    name: Format, lint, and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint every target and feature
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Build rustdoc with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --locked --no-deps
+
+  msrv:
+    name: MSRV 1.81
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: msrv
+      # The MSRV promise applies to published library targets. Dev tools such as
+      # trybuild intentionally follow stable Rust and are exercised elsewhere.
+      - run: cargo check --workspace --lib --all-features --locked
+
+  features:
+    name: Features (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core-only
+            args: --no-default-features
+          - name: tokio-only
+            args: --no-default-features --features runtime-tokio
+          - name: native-async
+            args: --no-default-features --features runtime-tokio,native-process,native-transport
+          - name: blocking-native
+            args: --no-default-features --features blocking,native-process,native-transport
+          - name: advanced-native
+            args: --no-default-features --features advanced,runtime-tokio,native-process,native-transport
+          - name: all
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: features-${{ matrix.name }}
+      - name: Compile workspace configuration
+        run: cargo check --workspace --all-targets --locked ${{ matrix.args }}
+      - name: Exercise daemonkit unit tests in configuration
+        run: cargo test -p daemonkit --lib --locked ${{ matrix.args }}
+
+  native-platform:
+    name: Native contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
-
-  quality:
-    name: format, lint, and docs
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
-      - run: cargo doc --workspace --all-features --no-deps
+          key: native-${{ matrix.os }}
+      - name: Platform storage, security, transport, and protocol contracts
+        run: cargo test -p daemonkit --all-features --lib --locked -- --nocapture
+      - name: Real embedded and managed process lifecycle
+        run: cargo test -p daemonkit --all-features --test native_lifecycle --locked -- --nocapture --test-threads=1
+      - name: Deterministic lifecycle model and invariant suite
+        run: cargo test -p daemonkit-testkit --all-features --locked -- --nocapture
+
+  compile-api:
+    name: Public API compile contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo test -p daemonkit --all-features --test compile --locked -- --nocapture
+
+  lifecycle-stress:
+    name: Repeated real-process lifecycle stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: lifecycle-stress
+      - name: Repeat concurrency, cancellation, crash, and tree-cleanup contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "Lifecycle stress attempt ${attempt}"
+            cargo test -p daemonkit --all-features --test native_lifecycle --locked -- --nocapture --test-threads=1
+          done
+
+  package:
+    name: Publishable package contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Package runtime crate and verify its isolated build
+        run: cargo package -p daemonkit --locked
+      - name: Audit companion crate package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package -p daemonkit-testkit --locked --list | tee /tmp/daemonkit-testkit-package.txt
+          grep -Fx Cargo.toml /tmp/daemonkit-testkit-package.txt
+          grep -Fx src/lib.rs /tmp/daemonkit-testkit-package.txt
+          # Full verification requires daemonkit 0.1.0 to be published first;
+          # Cargo intentionally resolves registry dependencies while packaging.
+
+  audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

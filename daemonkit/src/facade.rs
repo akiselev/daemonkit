@@ -657,6 +657,23 @@ mod tests {
     }
 
     #[test]
+    fn public_daemon_constructors_reject_reserved_bootstrap_environment() {
+        for key in [
+            "DAEMONKIT_PRIVATE_BOOTSTRAP",
+            "daemonkit_private_bootstrap_nonce",
+        ] {
+            let error = match Daemon::embedded(
+                DaemonSpec::new("com.example.reserved-env").unwrap(),
+                Spawn::program("worker").env(key, "attacker-controlled"),
+            ) {
+                Ok(_) => panic!("reserved bootstrap environment was accepted"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, crate::ConfigError::ReservedEnvironment(_)));
+        }
+    }
+
+    #[test]
     fn common_constructors_infer_mode_and_platform() {
         let spec = DaemonSpec::new("com.example.worker")
             .unwrap()
