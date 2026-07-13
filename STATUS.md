@@ -39,7 +39,8 @@ supervised managed children; the cross-platform CI matrix is active and passing.
   storage/security/transport/protocol contracts plus real embedded and managed
   lifecycle suites. The matrix also covers six feature configurations, public
   API compilation, repeated race/cancellation/crash/tree-cleanup stress,
-  package validation, and RustSec audit. Run 29269740920 passed all 15 jobs.
+  package validation, and RustSec audit. PR #1 merged to `master` as
+  09f5d3a; post-merge run 29271759559 passed all 15 jobs.
 - Hosted failures improved the runtime: compact 128-bit state-directory routing
   avoids Windows atomic-store temporary-path limits, while Unix control sockets
   use a verified short per-user directory so macOS handles deep runtime roots.
