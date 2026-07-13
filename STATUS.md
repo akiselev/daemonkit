@@ -1,8 +1,7 @@
 # Status
 
-Phase 0 is complete. Phase 1 native identity/root/lock/store work is in
-progress; Linux contracts are running, while Windows root ACL verification is
-still deliberately fail-closed pending its native implementation.
+Phase 0 is complete. Phase 1 identity/root/lock/store implementation is complete
+and its native contract suite is wired for Linux, macOS, and Windows CI.
 
 ## Latest
 
@@ -73,6 +72,10 @@ still deliberately fail-closed pending its native implementation.
   to an async runtime. Real child-process fixtures now prove cross-process lock
   exclusion, release-on-exit, and old-or-new atomic record visibility when a
   publisher exits at write, sync, and rename boundaries.
+- Implemented Windows runtime roots under `%LOCALAPPDATA%` with explicit,
+  protected, inheritable current-logon-only DACLs. Reverification checks the
+  owner SID, protected-DACL flag, and every granting ACE; unsafe roots fail
+  closed. Added a three-OS GitHub Actions test matrix plus format/lint/docs gate.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
 - Current gates pass: 43 unit tests, seven compile API cases, one doctest,
@@ -80,6 +83,6 @@ still deliberately fail-closed pending its native implementation.
 
 ## Next
 
-Continue Phase 1: implement Windows current-logon DACL creation/verification and
-strengthen directory-handle-relative traversal against swaps. Then run native
-contract suites on Linux/macOS/Windows CI before Phase 2 transport work.
+Begin Phase 2: native UDS/secured named-pipe transport, bounded authenticated
+control framing, negotiation, control roles, and transparent application stream
+handoff. Native Windows/macOS execution remains CI evidence, not local evidence.
