@@ -15,7 +15,7 @@ use crate::{
     record::{ControlEndpointRecord, InstanceRecord, INSTANCE_RECORD_SCHEMA},
     BinaryCompatibility, Compatibility, DaemonKey, DaemonSpec, Error, GenerationId, InstanceId,
     InstanceStatus, InstanceSummary, LifecycleState, LogPolicy, MismatchAction, RepairAction,
-    RepairOutcome, RuntimeRoot, Spawn, StopOutcome,
+    RepairOutcome, RuntimeRoot, Spawn, StartupDiagnostics, StartupPhase, StopOutcome,
 };
 use std::{
     fs::{File, OpenOptions},
@@ -32,6 +32,7 @@ pub(crate) struct NativeController {
     isolation: [u8; 32],
     startup_timeout: Duration,
     shutdown_timeout: Duration,
+    idle_timeout: Option<Duration>,
     compatibility: Compatibility,
     logs: LogPolicy,
     runtime_root: Option<RuntimeRoot>,
@@ -51,6 +52,7 @@ impl NativeController {
                 }),
             startup_timeout: spec.startup_timeout,
             shutdown_timeout: spec.shutdown_timeout,
+            idle_timeout: spec.idle_timeout,
             compatibility: spec.compatibility.clone(),
             logs: spec.logs.clone(),
             runtime_root: spec.runtime_root.clone(),
@@ -117,8 +119,16 @@ impl NativeController {
         command.process_group(0);
         #[cfg(windows)]
         command.creation_flags(0x0000_0200 | 0x0800_0000); // NEW_PROCESS_GROUP | NO_WINDOW
-        let mut child = command.spawn().map_err(|error| Error::Bootstrap {
-            message: error.to_string(),
+        let mut child = command.spawn().map_err(|error| {
+            startup_error(
+                spawn,
+                layout,
+                generation_layout.path(),
+                None,
+                StartupPhase::Spawn,
+                error,
+                self.logs.tail_bytes,
+            )
         })?;
         let process_id = child.id().ok_or_else(|| Error::Bootstrap {
             message: "spawned child has no process id".into(),
@@ -149,15 +159,51 @@ impl NativeController {
             config: self.compatibility.config.0,
             endpoint: endpoint.clone(),
             lease_path: layout.path().join("lease.lock"),
+            idle_timeout_millis: self
+                .idle_timeout
+                .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
         };
-        write_bootstrap(&mut stdin, &BootstrapCommand::Launch(Box::new(launch))).await?;
+        write_bootstrap(&mut stdin, &BootstrapCommand::Launch(Box::new(launch)))
+            .await
+            .map_err(|error| {
+                startup_error(
+                    spawn,
+                    layout,
+                    generation_layout.path(),
+                    Some(process_id),
+                    StartupPhase::BootstrapChannel,
+                    error,
+                    self.logs.tail_bytes,
+                )
+            })?;
 
         let hello = self.client_hello(generation, token, ConnectionRole::Control);
-        let mut prepared = self.connect_until(&endpoint, self.startup_timeout).await?;
+        let mut prepared = self
+            .connect_until(&endpoint, self.startup_timeout)
+            .await
+            .map_err(|error| {
+                startup_error(
+                    spawn,
+                    layout,
+                    generation_layout.path(),
+                    Some(process_id),
+                    StartupPhase::Prepare,
+                    error,
+                    self.logs.tail_bytes,
+                )
+            })?;
         client_handshake(&mut prepared, &hello, self.startup_timeout)
             .await
-            .map_err(|error| Error::Bootstrap {
-                message: error.to_string(),
+            .map_err(|error| {
+                startup_error(
+                    spawn,
+                    layout,
+                    generation_layout.path(),
+                    Some(process_id),
+                    StartupPhase::Authenticate,
+                    error,
+                    self.logs.tail_bytes,
+                )
             })?;
 
         let now = SystemTime::now()
@@ -189,7 +235,17 @@ impl NativeController {
         layout
             .record_store()
             .publish_record(&record)
-            .map_err(map_store)?;
+            .map_err(|error| {
+                startup_error(
+                    spawn,
+                    layout,
+                    generation_layout.path(),
+                    Some(process_id),
+                    StartupPhase::Publish,
+                    error,
+                    self.logs.tail_bytes,
+                )
+            })?;
         write_bootstrap(
             &mut stdin,
             &BootstrapCommand::Commit {
@@ -197,13 +253,34 @@ impl NativeController {
                 nonce,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            startup_error(
+                spawn,
+                layout,
+                generation_layout.path(),
+                Some(process_id),
+                StartupPhase::Commit,
+                error,
+                self.logs.tail_bytes,
+            )
+        })?;
         drop(stdin);
         record.state = LifecycleState::Ready;
         layout
             .record_store()
             .publish_record(&record)
-            .map_err(map_store)?;
+            .map_err(|error| {
+                startup_error(
+                    spawn,
+                    layout,
+                    generation_layout.path(),
+                    Some(process_id),
+                    StartupPhase::Commit,
+                    error,
+                    self.logs.tail_bytes,
+                )
+            })?;
         let _ = layout.prune_generations(&self.logs, Some(generation), None);
         rollback.disarm();
         Ok(self.native_instance(record))
@@ -361,7 +438,10 @@ impl NativeController {
         let hello = self.client_hello(record.generation, record.authentication_token, role);
         let negotiated = client_handshake(&mut stream, &hello, self.startup_timeout)
             .await
-            .map_err(|_| Error::AuthenticationFailed)?;
+            .map_err(|error| match error {
+                crate::protocol::ProtocolError::BusyQuiescing => Error::BusyQuiescing,
+                _ => Error::AuthenticationFailed,
+            })?;
         if negotiated.process_identity != record.process_identity.clone().unwrap_or_default()
             || negotiated.process_id != record.process_id.unwrap_or_default()
             || negotiated.build != record.build_fingerprint
@@ -607,6 +687,47 @@ fn map_layout(error: super::layout::LayoutError) -> Error {
     Error::StateDirectory {
         path: PathBuf::new(),
         message: error.to_string(),
+    }
+}
+
+fn startup_error(
+    spawn: &Spawn,
+    layout: &InstanceLayout,
+    generation_directory: &std::path::Path,
+    process_id: Option<u32>,
+    phase: StartupPhase,
+    error: impl std::fmt::Display,
+    tail_bytes: usize,
+) -> Error {
+    let stdout = generation_directory.join("stdout.log");
+    let stderr = generation_directory.join("stderr.log");
+    let (stdout_tail, stdout_truncated) = read_tail(&stdout, tail_bytes);
+    let (stderr_tail, stderr_truncated) = read_tail(&stderr, tail_bytes);
+    Error::Startup {
+        phase,
+        diagnostics: Box::new(StartupDiagnostics {
+            phase,
+            command: format!("{spawn:?}"),
+            process_id,
+            stdout_tail,
+            stderr_tail,
+            stdout_truncated,
+            stderr_truncated,
+            log_path: Some(generation_directory.join("daemon.log")),
+            instance_path: layout.path().to_owned(),
+        }),
+        message: error.to_string(),
+    }
+}
+
+fn read_tail(path: &std::path::Path, maximum: usize) -> (Vec<u8>, bool) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (Vec::new(), false);
+    };
+    if bytes.len() <= maximum {
+        (bytes, false)
+    } else {
+        (bytes[bytes.len() - maximum..].to_vec(), true)
     }
 }
 

@@ -270,6 +270,10 @@ where
         write_frame(stream, &[WIRE_REJECT]).await?;
         return Err(ProtocolError::Authentication);
     }
+    if hello.role == ConnectionRole::Application && identity.state == STATE_QUIESCING {
+        write_frame(stream, &[WIRE_BUSY_QUIESCING]).await?;
+        return Err(ProtocolError::BusyQuiescing);
+    }
     let negotiated = Negotiated {
         version: version.expect("authenticated version overlap"),
         generation: identity.generation,
@@ -298,6 +302,9 @@ where
         let response = read_frame(stream).await?;
         if response.as_slice() == [WIRE_REJECT] {
             return Err(ProtocolError::Authentication);
+        }
+        if response.as_slice() == [WIRE_BUSY_QUIESCING] {
+            return Err(ProtocolError::BusyQuiescing);
         }
         let negotiated = decode_server_hello(&response)?;
         if negotiated.generation != hello.generation
@@ -412,6 +419,7 @@ const WIRE_SERVER_HELLO: u8 = 2;
 const WIRE_CONTROL_REQUEST: u8 = 3;
 const WIRE_CONTROL_RESPONSE: u8 = 4;
 const WIRE_REJECT: u8 = 255;
+const WIRE_BUSY_QUIESCING: u8 = 254;
 const MAX_PROCESS_IDENTITY: usize = 1024;
 
 #[cfg(feature = "runtime-tokio")]
@@ -671,6 +679,8 @@ pub(crate) enum ProtocolError {
     Deadline,
     #[error("application-role connection attempted a control operation")]
     RoleViolation,
+    #[error("daemon generation is quiescing")]
+    BusyQuiescing,
 }
 
 /// Semantic failure boundaries. Their meaning is a testkit compatibility API.
@@ -793,6 +803,24 @@ mod tests {
                 Err(ProtocolError::Authentication)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn application_handshake_reports_quiescing_as_a_typed_retry() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let mut quiescing = identity();
+        quiescing.state = STATE_QUIESCING;
+        let server_task = tokio::spawn(async move {
+            server_handshake(&mut server, &quiescing, Duration::from_secs(1)).await
+        });
+        assert!(matches!(
+            client_handshake(&mut client, &hello(), Duration::from_secs(1)).await,
+            Err(ProtocolError::BusyQuiescing)
+        ));
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(ProtocolError::BusyQuiescing)
+        ));
     }
 
     #[tokio::test]

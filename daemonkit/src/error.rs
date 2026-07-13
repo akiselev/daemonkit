@@ -57,6 +57,8 @@ pub enum Error {
     },
     #[error("daemon authentication failed")]
     AuthenticationFailed,
+    #[error("daemon generation is quiescing; retry through ensure")]
+    BusyQuiescing,
     #[error("daemon bootstrap failed: {message}")]
     Bootstrap { message: String },
     #[error("daemon is unavailable")]

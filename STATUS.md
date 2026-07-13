@@ -1,7 +1,6 @@
 # Status
 
-Phases 0-2 are implemented. Phase 3 bootstrap and embedded lifecycle is in
-progress; the native transactional embedded path now runs end to end.
+Phases 0-3 are implemented. Phase 4 managed-child supervision is next.
 
 ## Latest
 
@@ -109,15 +108,23 @@ progress; the native transactional embedded path now runs end to end.
   cancellation after spawn, recovery, repeated ensure, and repeated stop. UDS
   endpoints now use a short verified-root socket namespace so long digest-based
   instance paths remain within the portable Unix path budget.
+- Completed embedded idle/drain semantics with tracked application-stream
+  lifetimes. Idle shutdown quiesces only with no active stream; drain stops new
+  handoffs and waits for existing streams. Application handshakes receive typed
+  `BusyQuiescing`, so callers can retry through `ensure` without mistaking an
+  accepted-then-dropped stream for success.
+- Added redaction-safe startup diagnostics with bounded stdout/stderr tails and
+  phase/process/log/path context. Real-process regressions cover captured child
+  failure output, compatibility restart, explicit restart, crashed-generation
+  repair, idle restart, and concurrent ensure/restart/stop serialization.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
-- Current local gates pass: 58 unit/integration tests, seven compile API cases,
+- Current local gates pass: 64 unit/integration tests, seven compile API cases,
   one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Continue Phase 3: add idle shutdown/race handling, richer startup diagnostics,
-compatibility and stale-repair real-process cases, and the remaining
-interruption-matrix schedules before closing the phase. Native Windows/macOS
-execution remains CI evidence, not local evidence.
+Begin Phase 4: managed command/readiness/endpoint/log/shutdown contracts,
+Unix process-group supervision, Windows Job Objects, and wrapper/grandchild
+fixtures. Native Windows/macOS execution remains CI evidence, not local evidence.

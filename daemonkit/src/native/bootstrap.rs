@@ -24,6 +24,7 @@ pub(crate) struct LaunchConfig {
     pub(crate) config: [u8; 32],
     pub(crate) endpoint: NativeEndpoint,
     pub(crate) lease_path: std::path::PathBuf,
+    pub(crate) idle_timeout_millis: Option<u64>,
 }
 
 impl LaunchConfig {

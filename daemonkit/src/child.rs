@@ -13,19 +13,21 @@ use crate::{
 use crate::{AuthenticatedStream, Error, PublishedEndpoint, Spawn};
 use futures_core::Stream;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicUsize, Ordering},
     Arc,
 };
 use std::{
     error::Error as StdError,
     ffi::OsString,
     future::Future,
+    io,
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Validated one-shot inherited bootstrap channel.
 pub struct Bootstrap {
@@ -146,7 +148,10 @@ impl Bootstrap {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let state = Arc::new(AtomicU8::new(STATE_READY));
+        let active_streams = Arc::new(AtomicUsize::new(0));
+        let (activity_tx, activity_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
         let accept_state = state.clone();
+        let accept_active = active_streams.clone();
         let accept_identity = launch.server_identity(STATE_READY);
         let accept_shutdown = shutdown_tx.clone();
         let accept_task = tokio::spawn(async move {
@@ -156,8 +161,19 @@ impl Bootstrap {
                 accept_state,
                 incoming_tx,
                 accept_shutdown,
+                accept_active,
+                activity_tx,
             )
             .await
+        });
+        let idle_task = launch.idle_timeout_millis.map(|millis| {
+            tokio::spawn(idle_monitor(
+                Duration::from_millis(millis),
+                state.clone(),
+                active_streams,
+                activity_rx,
+                shutdown_tx.clone(),
+            ))
         });
         let context = ServiceContext {
             generation: crate::GenerationId(u128::from_be_bytes(launch.generation)),
@@ -172,6 +188,9 @@ impl Bootstrap {
         state.store(STATE_STOPPING, Ordering::SeqCst);
         let _ = shutdown_tx.send(true);
         accept_task.abort();
+        if let Some(task) = idle_task {
+            task.abort();
+        }
         service_result.map_err(bootstrap_error)
     }
 }
@@ -187,6 +206,8 @@ async fn accept_loop(
     state: Arc<AtomicU8>,
     incoming: tokio::sync::mpsc::Sender<Result<AuthenticatedStream, AcceptError>>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    active_streams: Arc<AtomicUsize>,
+    activity: tokio::sync::watch::Sender<tokio::time::Instant>,
 ) -> Result<(), Error> {
     loop {
         let mut stream = listener.accept().await.map_err(bootstrap_error)?;
@@ -204,8 +225,20 @@ async fn accept_loop(
         };
         match role {
             ConnectionRole::Application if state.load(Ordering::SeqCst) == STATE_READY => {
+                active_streams.fetch_add(1, Ordering::SeqCst);
+                let _ = activity.send(tokio::time::Instant::now());
+                if state.load(Ordering::SeqCst) != STATE_READY {
+                    active_streams.fetch_sub(1, Ordering::SeqCst);
+                    let _ = activity.send(tokio::time::Instant::now());
+                    continue;
+                }
+                let tracked = TrackedStream {
+                    inner: stream,
+                    active_streams: active_streams.clone(),
+                    activity: activity.clone(),
+                };
                 if incoming
-                    .send(Ok(stream.into_authenticated()))
+                    .send(Ok(AuthenticatedStream::from_stream(tracked)))
                     .await
                     .is_err()
                 {
@@ -216,6 +249,7 @@ async fn accept_loop(
             ConnectionRole::Control => {
                 let connection_state = state.clone();
                 let connection_shutdown = shutdown.clone();
+                let connection_active = active_streams.clone();
                 let capabilities = identity.capabilities;
                 tokio::spawn(async move {
                     while let Ok(request) = read_control_request(&mut stream).await {
@@ -229,6 +263,9 @@ async fn accept_loop(
                         match (&request, &response) {
                             (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
                                 connection_state.store(STATE_QUIESCING, Ordering::SeqCst);
+                                while connection_active.load(Ordering::SeqCst) != 0 {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
                             }
                             (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
                                 connection_state.store(STATE_STOPPING, Ordering::SeqCst);
@@ -246,6 +283,79 @@ async fn accept_loop(
                 });
             }
         }
+    }
+}
+
+async fn idle_monitor(
+    timeout: Duration,
+    state: Arc<AtomicU8>,
+    active_streams: Arc<AtomicUsize>,
+    mut activity: tokio::sync::watch::Receiver<tokio::time::Instant>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+) {
+    loop {
+        let deadline = *activity.borrow() + timeout;
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                if active_streams.load(Ordering::SeqCst) == 0
+                    && state.compare_exchange(
+                        STATE_READY,
+                        STATE_QUIESCING,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ).is_ok()
+                {
+                    let _ = shutdown.send(true);
+                    return;
+                }
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+struct TrackedStream {
+    inner: crate::native::transport::NativeStream,
+    active_streams: Arc<AtomicUsize>,
+    activity: tokio::sync::watch::Sender<tokio::time::Instant>,
+}
+
+impl Drop for TrackedStream {
+    fn drop(&mut self) {
+        self.active_streams.fetch_sub(1, Ordering::SeqCst);
+        let _ = self.activity.send(tokio::time::Instant::now());
+    }
+}
+
+impl AsyncRead for TrackedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for TrackedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 
