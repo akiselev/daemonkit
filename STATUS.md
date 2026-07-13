@@ -47,6 +47,8 @@ supervised managed children; the cross-platform CI matrix is active and passing.
 
 ## Next
 
-Phase 5: run the broader platform/race/security/resource matrix, benchmark and
-bound hot paths, exercise debugger-cli and ghidra-cli migration spikes, and
-finish release documentation, support matrix, changelog, and security model.
+Release preparation: public README, crate READMEs, usage/security guide, and
+release checklist are complete for `0.1.0`; tag-triggered publishing and the
+GitHub release remain intentionally paused pending final release workflow
+review. After that: Phase 5 platform/race/security/resource hardening,
+benchmarks, and debugger-cli/ghidra-cli migration spikes.
