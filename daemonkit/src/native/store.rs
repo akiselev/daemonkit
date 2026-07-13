@@ -1,3 +1,4 @@
+use crate::record::{InstanceRecord, RecordValidationError};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
@@ -126,6 +127,33 @@ impl AtomicStore {
             })
             .transpose()
     }
+
+    pub(crate) fn read_record(&self) -> Result<Option<InstanceRecord>, StoreError> {
+        let record = self.decode_json::<InstanceRecord>()?;
+        if let Some(record) = &record {
+            record
+                .validate()
+                .map_err(|source| StoreError::InvalidRecord {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn publish_record(&self, record: &InstanceRecord) -> Result<(), StoreError> {
+        record
+            .validate()
+            .map_err(|source| StoreError::InvalidRecord {
+                path: self.path.clone(),
+                source,
+            })?;
+        let bytes = serde_json::to_vec(record).map_err(|source| StoreError::Corrupt {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.publish(&bytes)
+    }
 }
 
 fn inject(
@@ -248,6 +276,12 @@ pub(crate) enum StoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid instance record retained at {path:?}: {source}")]
+    InvalidRecord {
+        path: PathBuf,
+        #[source]
+        source: RecordValidationError,
+    },
     #[error("injected crash at {point:?}; staged file retained at {temporary:?}")]
     Injected {
         point: StoreFault,
@@ -258,7 +292,7 @@ pub(crate) enum StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, process::Command};
 
     #[test]
     fn publishes_and_atomically_replaces_records() {
@@ -315,5 +349,48 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"{truncated");
         fs::write(&path, vec![0; (MAX_RECORD_BYTES + 1) as usize]).unwrap();
         assert!(matches!(store.read(), Err(StoreError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn interrupted_publisher_child() {
+        let Some(path) = std::env::var_os("DAEMONKIT_STORE_FIXTURE") else {
+            return;
+        };
+        let fault = match std::env::var("DAEMONKIT_STORE_FAULT").unwrap().as_str() {
+            "write" => StoreFault::AfterWrite,
+            "sync" => StoreFault::AfterSync,
+            "rename" => StoreFault::AfterRename,
+            other => panic!("unknown store fixture fault {other}"),
+        };
+        assert!(matches!(
+            AtomicStore::new(path).publish_with_fault(b"new-record", Some(fault)),
+            Err(StoreError::Injected { .. })
+        ));
+    }
+
+    #[test]
+    fn process_exit_at_publication_boundaries_never_exposes_partial_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("instance.json");
+        let store = AtomicStore::new(&path);
+        store.publish(b"old-record").unwrap();
+        for (fault, expected) in [
+            ("write", b"old-record".as_slice()),
+            ("sync", b"old-record".as_slice()),
+            ("rename", b"new-record".as_slice()),
+        ] {
+            store.publish(b"old-record").unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native::store::tests::interrupted_publisher_child",
+                ])
+                .env("DAEMONKIT_STORE_FIXTURE", &path)
+                .env("DAEMONKIT_STORE_FAULT", fault)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(store.read().unwrap().unwrap(), expected);
+        }
     }
 }

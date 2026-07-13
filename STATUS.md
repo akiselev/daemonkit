@@ -65,14 +65,21 @@ still deliberately fail-closed pending its native implementation.
 - Added bounded atomic records: unique same-directory 0600 staging, write + file
   sync + atomic replace + Unix parent sync, no-follow reads, retained corrupt
   JSON, and semantic crash injection around every publication boundary.
+- Added verified digest-only instance/generation layouts with stable lifecycle
+  and lease authority paths, typed instance-record validation/publication, and
+  bounded count/byte retention that always preserves the active and latest
+  failed generations.
+- Made native lock waits cancellation-aware without coupling the lock primitive
+  to an async runtime. Real child-process fixtures now prove cross-process lock
+  exclusion, release-on-exit, and old-or-new atomic record visibility when a
+  publisher exits at write, sync, and rename boundaries.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
-- Current gates pass: 36 unit tests, seven compile API cases, one doctest,
+- Current gates pass: 43 unit tests, seven compile API cases, one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Continue Phase 1: implement Windows DACL root verification, bind verified roots
-to instance/generation layout handles, add lock cancellation/crash process
-fixtures, integrate typed instance records, and implement bounded generation
-retention. Then run native contract suites on Linux/macOS/Windows CI.
+Continue Phase 1: implement Windows current-logon DACL creation/verification and
+strengthen directory-handle-relative traversal against swaps. Then run native
+contract suites on Linux/macOS/Windows CI before Phase 2 transport work.
