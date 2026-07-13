@@ -1,17 +1,24 @@
 use daemonkit::{
-    advanced::{DynTransport, TransportConfig, TransportFuture},
-    AuthenticatedStream, DaemonSpec, Error,
+    advanced::{BoxedTransportStream, DynListener, DynTransport, TransportConfig, TransportFuture},
+    DaemonSpec, Error,
 };
 use std::sync::Arc;
 
 struct Transport;
+struct Listener;
+
+impl DynListener for Listener {
+    fn accept(&mut self) -> TransportFuture<BoxedTransportStream> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+}
 
 impl DynTransport for Transport {
-    fn bind(&self, _endpoint: &str) -> TransportFuture<()> {
+    fn bind(&self, _endpoint: &str) -> TransportFuture<Box<dyn DynListener>> {
         Box::pin(async { Err(Error::Unsupported) })
     }
 
-    fn connect(&self, _endpoint: &str) -> TransportFuture<AuthenticatedStream> {
+    fn connect(&self, _endpoint: &str) -> TransportFuture<BoxedTransportStream> {
         Box::pin(async { Err(Error::Unsupported) })
     }
 }

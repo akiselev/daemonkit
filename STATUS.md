@@ -1,7 +1,6 @@
 # Status
 
-Phases 0-1 are complete. Phase 2 authenticated control and native transport is
-in progress; the shared binary handshake contract is implemented.
+Phases 0-2 are implemented. Phase 3 bootstrap and embedded lifecycle is next.
 
 ## Latest
 
@@ -87,13 +86,22 @@ in progress; the shared binary handshake contract is implemented.
   attributes, first-instance/local-only byte pipes, replenishes accepts before
   handing off connections, and bounds busy-client retries. Native tests cover
   UDS replacement races and Windows pipe security/concurrency in OS CI.
+- Added request-ID-preserving control codecs and a capability-aware control
+  session for status, drain, shutdown, diagnostics, and application handoff.
+  Quiescing is entered before new streams are rejected with typed
+  `BusyQuiescing`; application-role streams cannot issue control requests.
+- Completed the object-safe custom transport seam with erased async byte
+  streams and accept-capable listeners. `AuthenticatedStream` now erases native
+  or custom transports without exposing backend traits. Native UDS and Windows
+  pipe tests run the real authenticated handshake before application echo.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
-- Current local gates pass: 51 unit tests, seven compile API cases, one doctest,
+- Current local gates pass: 55 unit tests, seven compile API cases, one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Continue Phase 2: implement bounded control request/response state and connect
-the native/custom transport seams to the authenticated stream facade. Native
-Windows/macOS execution remains CI evidence, not local evidence.
+Begin Phase 3: inherited bootstrap channel, deliberate spawn/detachment and
+stdio capture, prepared/publish/commit orchestration, cancellation rollback,
+compatibility/stale repair, and embedded service shutdown/idle behavior.
+Native Windows/macOS execution remains CI evidence, not local evidence.

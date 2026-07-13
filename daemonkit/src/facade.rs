@@ -393,7 +393,26 @@ impl InstancePaths<'_> {
 }
 
 #[cfg(feature = "runtime-tokio")]
-pub struct AuthenticatedStream(tokio::io::DuplexStream);
+pub trait TransportIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl<T> TransportIo for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub struct AuthenticatedStream(std::pin::Pin<Box<dyn TransportIo>>);
+
+#[cfg(feature = "runtime-tokio")]
+impl AuthenticatedStream {
+    pub(crate) fn from_stream(stream: impl TransportIo) -> Self {
+        Self(Box::pin(stream))
+    }
+}
 
 #[cfg(feature = "runtime-tokio")]
 impl tokio::io::AsyncRead for AuthenticatedStream {
@@ -402,7 +421,7 @@ impl tokio::io::AsyncRead for AuthenticatedStream {
         context: &mut std::task::Context<'_>,
         buffer: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(context, buffer)
+        self.0.as_mut().poll_read(context, buffer)
     }
 }
 
@@ -413,21 +432,21 @@ impl tokio::io::AsyncWrite for AuthenticatedStream {
         context: &mut std::task::Context<'_>,
         buffer: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.0).poll_write(context, buffer)
+        self.0.as_mut().poll_write(context, buffer)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(context)
+        self.0.as_mut().poll_flush(context)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(context)
+        self.0.as_mut().poll_shutdown(context)
     }
 }
 

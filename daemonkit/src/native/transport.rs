@@ -157,6 +157,11 @@ pub(crate) async fn connect(endpoint: &NativeEndpoint) -> io::Result<NativeStrea
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use crate::protocol::{
+        client_handshake, server_handshake, Capabilities, ClientHello, ConnectionRole,
+        ProtocolRange, ServerIdentity,
+    };
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -171,6 +176,9 @@ mod windows_tests {
             let endpoint = endpoint.clone();
             clients.push(tokio::spawn(async move {
                 let mut stream = connect(&endpoint).await.unwrap();
+                client_handshake(&mut stream, &test_hello(), Duration::from_secs(1))
+                    .await
+                    .unwrap();
                 stream.write_all(&[byte]).await.unwrap();
                 let mut response = [0];
                 stream.read_exact(&mut response).await.unwrap();
@@ -180,6 +188,10 @@ mod windows_tests {
         let mut received = Vec::new();
         for _ in 0..2 {
             let mut stream = listener.accept().await.unwrap();
+            let (_, role) = server_handshake(&mut stream, &test_identity(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(role, ConnectionRole::Application);
             let mut request = [0];
             stream.read_exact(&mut request).await.unwrap();
             stream.write_all(&request).await.unwrap();
@@ -199,6 +211,39 @@ mod windows_tests {
             Err(error) if error.kind() == io::ErrorKind::InvalidInput
         ));
     }
+
+    fn test_identity() -> ServerIdentity {
+        ServerIdentity {
+            app: [1; 32],
+            key: [2; 32],
+            isolation: [3; 32],
+            generation: 4,
+            token: [5; 32],
+            versions: ProtocolRange {
+                minimum: 1,
+                maximum: 1,
+            },
+            process_id: std::process::id(),
+            process_identity: vec![6],
+            build: [7; 32],
+            config: [8; 32],
+            state: 3,
+            capabilities: Capabilities::APPLICATION_STREAM,
+        }
+    }
+
+    fn test_hello() -> ClientHello {
+        let identity = test_identity();
+        ClientHello {
+            app: identity.app,
+            key: identity.key,
+            isolation: identity.isolation,
+            generation: identity.generation,
+            token: identity.token,
+            versions: identity.versions,
+            role: ConnectionRole::Application,
+        }
+    }
 }
 
 pub(crate) enum NativeStream {
@@ -208,6 +253,12 @@ pub(crate) enum NativeStream {
     WindowsClient(tokio::net::windows::named_pipe::NamedPipeClient),
     #[cfg(windows)]
     WindowsServer(tokio::net::windows::named_pipe::NamedPipeServer),
+}
+
+impl NativeStream {
+    pub(crate) fn into_authenticated(self) -> crate::AuthenticatedStream {
+        crate::AuthenticatedStream::from_stream(self)
+    }
 }
 
 impl AsyncRead for NativeStream {
@@ -269,6 +320,11 @@ impl AsyncWrite for NativeStream {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        client_handshake, server_handshake, Capabilities, ClientHello, ConnectionRole,
+        ProtocolRange, ServerIdentity,
+    };
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -298,6 +354,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unix_application_stream_is_authenticated_before_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = NativeEndpoint::Unix(directory.path().join("authenticated.sock"));
+        let mut listener = NativeListener::bind(&endpoint).unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = connect(&endpoint).await.unwrap();
+            client_handshake(&mut stream, &test_hello(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            let mut stream = stream.into_authenticated();
+            stream.write_all(b"echo").await.unwrap();
+            let mut response = [0; 4];
+            stream.read_exact(&mut response).await.unwrap();
+            response
+        });
+        let mut stream = listener.accept().await.unwrap();
+        let (_, role) = server_handshake(&mut stream, &test_identity(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(role, ConnectionRole::Application);
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(&request).await.unwrap();
+        assert_eq!(client.await.unwrap(), *b"echo");
+    }
+
+    #[tokio::test]
     async fn old_listener_does_not_unlink_replacement_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("control.sock");
@@ -317,5 +400,38 @@ mod tests {
             NativeListener::bind(&NativeEndpoint::Unix(path)),
             Err(error) if error.kind() == io::ErrorKind::InvalidInput
         ));
+    }
+
+    fn test_identity() -> ServerIdentity {
+        ServerIdentity {
+            app: [1; 32],
+            key: [2; 32],
+            isolation: [3; 32],
+            generation: 4,
+            token: [5; 32],
+            versions: ProtocolRange {
+                minimum: 1,
+                maximum: 1,
+            },
+            process_id: std::process::id(),
+            process_identity: vec![6],
+            build: [7; 32],
+            config: [8; 32],
+            state: 3,
+            capabilities: Capabilities::APPLICATION_STREAM,
+        }
+    }
+
+    fn test_hello() -> ClientHello {
+        let identity = test_identity();
+        ClientHello {
+            app: identity.app,
+            key: identity.key,
+            isolation: identity.isolation,
+            generation: identity.generation,
+            token: identity.token,
+            versions: identity.versions,
+            role: ConnectionRole::Application,
+        }
     }
 }

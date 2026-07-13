@@ -45,6 +45,96 @@ pub enum ControlMessage {
     },
 }
 
+#[cfg(feature = "runtime-tokio")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ControlResponse {
+    Status { request_id: u64, state: u8 },
+    Accepted { request_id: u64 },
+    Diagnostics { request_id: u64, bytes: Vec<u8> },
+    ApplicationStream { request_id: u64 },
+    BusyQuiescing { request_id: u64 },
+    Unsupported { request_id: u64 },
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub(crate) struct ControlSession {
+    role: ConnectionRole,
+    state: u8,
+    capabilities: Capabilities,
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl ControlSession {
+    pub(crate) fn new(role: ConnectionRole, state: u8, capabilities: Capabilities) -> Self {
+        Self {
+            role,
+            state,
+            capabilities,
+        }
+    }
+
+    pub(crate) fn handle(
+        &mut self,
+        request: &ControlMessage,
+        diagnostics: &[u8],
+    ) -> Result<ControlResponse, ProtocolError> {
+        if self.role != ConnectionRole::Control {
+            return Err(ProtocolError::RoleViolation);
+        }
+        let (request_id, needed) = match request {
+            ControlMessage::Hello { .. } => {
+                return Err(ProtocolError::Malformed("hello after authentication"))
+            }
+            ControlMessage::Status { request_id } => (*request_id, Capabilities::STATUS),
+            ControlMessage::Drain { request_id } => (*request_id, Capabilities::DRAIN),
+            ControlMessage::Shutdown { request_id } => (*request_id, Capabilities::SHUTDOWN),
+            ControlMessage::Diagnostics { request_id } => (*request_id, Capabilities::DIAGNOSTICS),
+            ControlMessage::OpenApplicationStream { request_id } => {
+                (*request_id, Capabilities::APPLICATION_STREAM)
+            }
+        };
+        if !self.capabilities.contains(needed) {
+            return Ok(ControlResponse::Unsupported { request_id });
+        }
+        Ok(match request {
+            ControlMessage::Status { .. } => ControlResponse::Status {
+                request_id,
+                state: self.state,
+            },
+            ControlMessage::Drain { .. } if self.state == STATE_QUIESCING => {
+                ControlResponse::BusyQuiescing { request_id }
+            }
+            ControlMessage::Drain { .. } => {
+                self.state = STATE_QUIESCING;
+                ControlResponse::Accepted { request_id }
+            }
+            ControlMessage::Shutdown { .. } => {
+                self.state = STATE_STOPPING;
+                ControlResponse::Accepted { request_id }
+            }
+            ControlMessage::Diagnostics { .. } => ControlResponse::Diagnostics {
+                request_id,
+                bytes: diagnostics[..diagnostics.len().min(MAX_DIAGNOSTICS_BYTES)].to_vec(),
+            },
+            ControlMessage::OpenApplicationStream { .. } if self.state == STATE_QUIESCING => {
+                ControlResponse::BusyQuiescing { request_id }
+            }
+            ControlMessage::OpenApplicationStream { .. } if self.state == STATE_READY => {
+                ControlResponse::ApplicationStream { request_id }
+            }
+            ControlMessage::OpenApplicationStream { .. } => {
+                ControlResponse::Unsupported { request_id }
+            }
+            ControlMessage::Hello { .. } => unreachable!("rejected above"),
+        })
+    }
+}
+
+const STATE_READY: u8 = 3;
+const STATE_QUIESCING: u8 = 4;
+const STATE_STOPPING: u8 = 5;
+const MAX_DIAGNOSTICS_BYTES: usize = 32 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Capabilities(u64);
 
@@ -277,8 +367,50 @@ where
     Ok(())
 }
 
+#[cfg(feature = "runtime-tokio")]
+pub(crate) async fn write_control_request<S>(
+    stream: &mut S,
+    request: &ControlMessage,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_frame(stream, &encode_control_request(request)?).await
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub(crate) async fn read_control_request<S>(stream: &mut S) -> Result<ControlMessage, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    decode_control_request(&read_frame(stream).await?)
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub(crate) async fn write_control_response<S>(
+    stream: &mut S,
+    response: &ControlResponse,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_frame(stream, &encode_control_response(response)).await
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub(crate) async fn read_control_response<S>(
+    stream: &mut S,
+) -> Result<ControlResponse, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    decode_control_response(&read_frame(stream).await?)
+}
+
 const WIRE_CLIENT_HELLO: u8 = 1;
 const WIRE_SERVER_HELLO: u8 = 2;
+const WIRE_CONTROL_REQUEST: u8 = 3;
+const WIRE_CONTROL_RESPONSE: u8 = 4;
 const WIRE_REJECT: u8 = 255;
 const MAX_PROCESS_IDENTITY: usize = 1024;
 
@@ -376,6 +508,104 @@ fn decode_server_hello(bytes: &[u8]) -> Result<Negotiated, ProtocolError> {
     Ok(negotiated)
 }
 
+#[cfg(feature = "runtime-tokio")]
+fn encode_control_request(request: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = Vec::with_capacity(10);
+    bytes.push(WIRE_CONTROL_REQUEST);
+    let (kind, request_id) = match request {
+        ControlMessage::Hello { .. } => {
+            return Err(ProtocolError::Malformed("hello is not a control request"))
+        }
+        ControlMessage::Status { request_id } => (1, request_id),
+        ControlMessage::Drain { request_id } => (2, request_id),
+        ControlMessage::Shutdown { request_id } => (3, request_id),
+        ControlMessage::Diagnostics { request_id } => (4, request_id),
+        ControlMessage::OpenApplicationStream { request_id } => (5, request_id),
+    };
+    bytes.push(kind);
+    bytes.extend_from_slice(&request_id.to_be_bytes());
+    Ok(bytes)
+}
+
+#[cfg(feature = "runtime-tokio")]
+fn decode_control_request(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.byte()? != WIRE_CONTROL_REQUEST {
+        return Err(ProtocolError::Malformed("expected control request"));
+    }
+    let kind = decoder.byte()?;
+    let request_id = u64::from_be_bytes(decoder.array()?);
+    decoder.finish()?;
+    Ok(match kind {
+        1 => ControlMessage::Status { request_id },
+        2 => ControlMessage::Drain { request_id },
+        3 => ControlMessage::Shutdown { request_id },
+        4 => ControlMessage::Diagnostics { request_id },
+        5 => ControlMessage::OpenApplicationStream { request_id },
+        _ => return Err(ProtocolError::Malformed("unknown control request")),
+    })
+}
+
+#[cfg(feature = "runtime-tokio")]
+fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.push(WIRE_CONTROL_RESPONSE);
+    let (kind, request_id) = match response {
+        ControlResponse::Status { request_id, .. } => (1, request_id),
+        ControlResponse::Accepted { request_id } => (2, request_id),
+        ControlResponse::Diagnostics { request_id, .. } => (3, request_id),
+        ControlResponse::ApplicationStream { request_id } => (4, request_id),
+        ControlResponse::BusyQuiescing { request_id } => (5, request_id),
+        ControlResponse::Unsupported { request_id } => (6, request_id),
+    };
+    bytes.push(kind);
+    bytes.extend_from_slice(&request_id.to_be_bytes());
+    match response {
+        ControlResponse::Status { state, .. } => bytes.push(*state),
+        ControlResponse::Diagnostics {
+            bytes: diagnostics, ..
+        } => {
+            bytes.extend_from_slice(&(diagnostics.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(diagnostics);
+        }
+        _ => {}
+    }
+    bytes
+}
+
+#[cfg(feature = "runtime-tokio")]
+fn decode_control_response(bytes: &[u8]) -> Result<ControlResponse, ProtocolError> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.byte()? != WIRE_CONTROL_RESPONSE {
+        return Err(ProtocolError::Malformed("expected control response"));
+    }
+    let kind = decoder.byte()?;
+    let request_id = u64::from_be_bytes(decoder.array()?);
+    let response = match kind {
+        1 => ControlResponse::Status {
+            request_id,
+            state: decoder.byte()?,
+        },
+        2 => ControlResponse::Accepted { request_id },
+        3 => {
+            let length = u32::from_be_bytes(decoder.array()?) as usize;
+            if length > MAX_DIAGNOSTICS_BYTES {
+                return Err(ProtocolError::Malformed("diagnostics response too large"));
+            }
+            ControlResponse::Diagnostics {
+                request_id,
+                bytes: decoder.bytes(length)?.to_vec(),
+            }
+        }
+        4 => ControlResponse::ApplicationStream { request_id },
+        5 => ControlResponse::BusyQuiescing { request_id },
+        6 => ControlResponse::Unsupported { request_id },
+        _ => return Err(ProtocolError::Malformed("unknown control response")),
+    };
+    decoder.finish()?;
+    Ok(response)
+}
+
 fn negotiate(client: ProtocolRange, server: ProtocolRange) -> Option<u16> {
     let minimum = client.minimum.max(server.minimum);
     let maximum = client.maximum.min(server.maximum);
@@ -439,6 +669,8 @@ pub(crate) enum ProtocolError {
     Authentication,
     #[error("control handshake deadline elapsed")]
     Deadline,
+    #[error("application-role connection attempted a control operation")]
+    RoleViolation,
 }
 
 /// Semantic failure boundaries. Their meaning is a testkit compatibility API.
@@ -589,6 +821,96 @@ mod tests {
         assert!(matches!(
             server_handshake(&mut server, &identity(), Duration::from_millis(5)).await,
             Err(ProtocolError::Deadline)
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_requests_round_trip_with_ids_and_bounded_diagnostics() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            let request = read_control_request(&mut server).await.unwrap();
+            assert_eq!(request, ControlMessage::Diagnostics { request_id: 42 });
+            write_control_response(
+                &mut server,
+                &ControlResponse::Diagnostics {
+                    request_id: 42,
+                    bytes: b"safe".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        write_control_request(&mut client, &ControlMessage::Diagnostics { request_id: 42 })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_control_response(&mut client).await.unwrap(),
+            ControlResponse::Diagnostics {
+                request_id: 42,
+                bytes: b"safe".to_vec()
+            }
+        );
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn control_state_quiesces_before_refusing_new_application_streams() {
+        let capabilities = Capabilities::STATUS
+            .union(Capabilities::DRAIN)
+            .union(Capabilities::SHUTDOWN)
+            .union(Capabilities::APPLICATION_STREAM);
+        let mut session = ControlSession::new(ConnectionRole::Control, STATE_READY, capabilities);
+        assert_eq!(
+            session
+                .handle(
+                    &ControlMessage::OpenApplicationStream { request_id: 1 },
+                    &[]
+                )
+                .unwrap(),
+            ControlResponse::ApplicationStream { request_id: 1 }
+        );
+        assert_eq!(
+            session
+                .handle(&ControlMessage::Drain { request_id: 2 }, &[])
+                .unwrap(),
+            ControlResponse::Accepted { request_id: 2 }
+        );
+        assert_eq!(
+            session
+                .handle(
+                    &ControlMessage::OpenApplicationStream { request_id: 3 },
+                    &[]
+                )
+                .unwrap(),
+            ControlResponse::BusyQuiescing { request_id: 3 }
+        );
+        assert_eq!(
+            session
+                .handle(&ControlMessage::Shutdown { request_id: 4 }, &[])
+                .unwrap(),
+            ControlResponse::Accepted { request_id: 4 }
+        );
+        assert_eq!(
+            session
+                .handle(&ControlMessage::Status { request_id: 5 }, &[])
+                .unwrap(),
+            ControlResponse::Status {
+                request_id: 5,
+                state: STATE_STOPPING
+            }
+        );
+    }
+
+    #[test]
+    fn application_role_cannot_issue_control_requests() {
+        let mut session = ControlSession::new(
+            ConnectionRole::Application,
+            STATE_READY,
+            Capabilities::STATUS,
+        );
+        assert!(matches!(
+            session.handle(&ControlMessage::Status { request_id: 1 }, &[]),
+            Err(ProtocolError::RoleViolation)
         ));
     }
 
