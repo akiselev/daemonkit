@@ -81,13 +81,19 @@ in progress; the shared binary handshake contract is implemented.
   capability exchange, constant-time token comparison, and uniform rejection
   of app/key/isolation/generation/token/protocol mismatches. Application-role
   tests prove that bytes are transparent immediately after authentication.
+- Added native local transport streams/listeners. Unix uses generation-owned
+  filesystem UDS, rejects squatters and over-budget paths, and verifies socket
+  file identity before cleanup. Windows uses current-logon-only security
+  attributes, first-instance/local-only byte pipes, replenishes accepts before
+  handing off connections, and bounds busy-client retries. Native tests cover
+  UDS replacement races and Windows pipe security/concurrency in OS CI.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
-- Current gates pass: 48 unit tests, seven compile API cases, one doctest,
+- Current local gates pass: 51 unit tests, seven compile API cases, one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Continue Phase 2: implement UDS and secured named-pipe listeners/connectors,
-then control request/response state and object-safe custom transport adaptation.
-Native Windows/macOS execution remains CI evidence, not local evidence.
+Continue Phase 2: implement bounded control request/response state and connect
+the native/custom transport seams to the authenticated stream facade. Native
+Windows/macOS execution remains CI evidence, not local evidence.

@@ -143,7 +143,7 @@ fn verify_private_directory(path: &Path) -> Result<(), RootError> {
 }
 
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use super::*;
     use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
@@ -211,6 +211,21 @@ mod windows {
     }
 
     pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
+        with_current_user_security(|attributes| {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { CreateDirectoryW(wide.as_ptr(), attributes) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Build current-logon-only security attributes and keep every referenced
+    /// allocation alive for the duration of the native object creation call.
+    pub(crate) fn with_current_user_security<T>(
+        create: impl FnOnce(*const SECURITY_ATTRIBUTES) -> io::Result<T>,
+    ) -> io::Result<T> {
         let user = CurrentUserSid::query()?;
         let sid_bytes = unsafe { GetLengthSid(user.sid) } as usize;
         if sid_bytes == 0 {
@@ -250,12 +265,7 @@ mod windows {
             lpSecurityDescriptor: descriptor_ptr,
             bInheritHandle: 0,
         };
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        create(&attributes)
     }
 
     pub(super) fn verify_private_directory_acl(path: &Path) -> io::Result<()> {
