@@ -40,16 +40,16 @@ supervised managed children; the cross-platform CI matrix is active and passing.
   lifecycle suites. The matrix also covers six feature configurations, public
   API compilation, repeated race/cancellation/crash/tree-cleanup stress,
   package validation, and RustSec audit. PR #1 merged to `master` as
-  09f5d3a; post-merge run 29271759559 passed all 15 jobs.
+  09f5d3a; post-merge run 29271759559 passed all 15 jobs. The `v0.1.0`
+  release run 29273351819 passed every gate, published both crates to
+  crates.io, and created the public GitHub release.
 - Hosted failures improved the runtime: compact 128-bit state-directory routing
   avoids Windows atomic-store temporary-path limits, while Unix control sockets
   use a verified short per-user directory so macOS handles deep runtime roots.
 
 ## Next
 
-Release preparation: public README, crate READMEs, usage/security guide, and
-release checklist are complete for `0.1.0`. The tag-triggered workflow reruns
-all release gates, publishes `daemonkit` before `daemonkit-testkit`, and only
-then creates the GitHub release; `v0.1.0` has not yet been created. After that:
-Phase 5 platform/race/security/resource hardening, benchmarks, and
-debugger-cli/ghidra-cli migration spikes.
+`v0.1.0` is released. The tag-triggered workflow reran every gate before
+publishing `daemonkit`, then `daemonkit-testkit`, and creating the GitHub
+release. Next: Phase 5 platform/race/security/resource hardening, benchmarks,
+and debugger-cli/ghidra-cli migration spikes.
