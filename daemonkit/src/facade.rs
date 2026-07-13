@@ -5,6 +5,7 @@ use std::{
     fmt,
     marker::PhantomData,
     path::PathBuf,
+    sync::Arc,
 };
 
 /// Sealed production platform bundle.
@@ -86,12 +87,29 @@ impl Spawn {
         self
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.program.is_empty() {
-            Err(ConfigError::EmptyProgram)
-        } else {
-            Ok(())
+            return Err(ConfigError::EmptyProgram);
         }
+        for (key, _) in &self.env {
+            let key_text = key.to_string_lossy();
+            if key_text.eq_ignore_ascii_case("DAEMONKIT_PRIVATE_BOOTSTRAP")
+                || key_text.eq_ignore_ascii_case("DAEMONKIT_PRIVATE_BOOTSTRAP_NONCE")
+            {
+                return Err(ConfigError::ReservedEnvironment(key.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    pub(crate) fn command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(&self.args).envs(self.env.iter().cloned());
+        if let Some(directory) = &self.current_dir {
+            command.current_dir(directory);
+        }
+        command
     }
 }
 
@@ -134,6 +152,12 @@ impl fmt::Debug for Spawn {
 struct Controller<P> {
     instance: InstanceId,
     platform: P,
+    #[cfg(all(
+        feature = "runtime-tokio",
+        feature = "native-process",
+        feature = "native-transport"
+    ))]
+    native: Arc<crate::native::lifecycle::NativeController>,
 }
 
 fn controller<K: DaemonKey>(spec: DaemonSpec<K>) -> Controller<DefaultPlatform> {
@@ -141,23 +165,21 @@ fn controller<K: DaemonKey>(spec: DaemonSpec<K>) -> Controller<DefaultPlatform> 
     hash.update(b"daemonkit:instance:v1\0");
     hash.update(format!("{:?}", spec.app));
     hash.update(spec.key.digest().0);
-    if let Some(isolation) = spec.isolation {
+    if let Some(isolation) = &spec.isolation {
         hash.update(format!("{isolation:?}"));
     }
-    // Policy fields are deliberately consumed into the controller construction
-    // boundary even before native orchestration lands.
-    let _policy = (
-        spec.startup_timeout,
-        spec.shutdown_timeout,
-        spec.drain_timeout,
-        spec.idle_timeout,
-        spec.compatibility,
-        spec.logs,
-        spec.transport,
-        spec.runtime_root,
-    );
+    let instance = InstanceId(hash.finalize().into());
     Controller {
-        instance: InstanceId(hash.finalize().into()),
+        #[cfg(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        ))]
+        native: Arc::new(crate::native::lifecycle::NativeController::new(
+            &spec,
+            instance.clone(),
+        )),
+        instance,
         platform: DefaultPlatform,
     }
 }
@@ -195,29 +217,54 @@ impl Daemon<crate::Managed> {
     }
 }
 
-impl<M, P: Platform> Daemon<M, P> {
+impl<M> Daemon<M, DefaultPlatform> {
     pub async fn ensure(&self) -> Result<Instance<M>, Error> {
-        let _ = (&self.spawn, &self.controller.platform);
+        let _ = &self.controller.platform;
+        #[cfg(all(feature = "native-process", feature = "native-transport"))]
+        return self
+            .controller
+            .native
+            .ensure(&self.spawn)
+            .await
+            .map(|native| instance_from_native(self.controller.clone(), native));
+        #[cfg(not(all(feature = "native-process", feature = "native-transport")))]
         Err(Error::Unsupported)
     }
 
     pub async fn status(&self) -> Result<InstanceStatus, Error> {
+        #[cfg(all(feature = "native-process", feature = "native-transport"))]
+        return self.controller.native.status().await;
+        #[cfg(not(all(feature = "native-process", feature = "native-transport")))]
         Err(Error::Unsupported)
     }
 
     pub async fn stop(&self) -> Result<StopOutcome, Error> {
+        #[cfg(all(feature = "native-process", feature = "native-transport"))]
+        return self.controller.native.stop().await;
+        #[cfg(not(all(feature = "native-process", feature = "native-transport")))]
         Err(Error::Unsupported)
     }
 
     pub async fn restart(&self) -> Result<Instance<M>, Error> {
+        #[cfg(all(feature = "native-process", feature = "native-transport"))]
+        return self
+            .controller
+            .native
+            .restart(&self.spawn)
+            .await
+            .map(|native| instance_from_native(self.controller.clone(), native));
+        #[cfg(not(all(feature = "native-process", feature = "native-transport")))]
         Err(Error::Unsupported)
     }
 
     pub async fn repair(&self) -> Result<RepairOutcome, Error> {
+        #[cfg(all(feature = "native-process", feature = "native-transport"))]
+        return self.controller.native.repair().await;
+        #[cfg(not(all(feature = "native-process", feature = "native-transport")))]
         Err(Error::Unsupported)
     }
 
-    pub fn client(&self) -> DaemonClient<M, P> {
+    pub fn client(&self) -> DaemonClient<M, DefaultPlatform> {
         DaemonClient {
             controller: self.controller.clone(),
             _mode: PhantomData,
@@ -241,7 +288,11 @@ impl DaemonClient<crate::Embedded> {
 
     #[cfg(feature = "runtime-tokio")]
     pub async fn connect(&self) -> Result<AuthenticatedStream, Error> {
-        Err(Error::Unsupported)
+        let instance = self
+            .attach()
+            .await?
+            .ok_or(Error::Unavailable { generation: None })?;
+        instance.connect().await
     }
 }
 
@@ -254,21 +305,60 @@ impl DaemonClient<crate::Managed> {
     }
 
     pub async fn service_endpoint(&self) -> Result<PublishedEndpoint, Error> {
-        Err(Error::Unsupported)
+        let instance = self
+            .attach()
+            .await?
+            .ok_or(Error::Unavailable { generation: None })?;
+        instance.service_endpoint().cloned()
     }
 }
 
-impl<M, P: Platform> DaemonClient<M, P> {
+impl<M> DaemonClient<M, DefaultPlatform> {
     pub async fn attach(&self) -> Result<Option<Instance<M>>, Error> {
         let _ = &self.controller.platform;
+        #[cfg(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        ))]
+        return self.controller.native.attach().await.map(|value| {
+            value.map(|native| instance_from_native(self.controller.clone(), native))
+        });
+        #[cfg(not(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        )))]
         Err(Error::Unsupported)
     }
 
     pub async fn status(&self) -> Result<InstanceStatus, Error> {
+        #[cfg(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        ))]
+        return self.controller.native.status().await;
+        #[cfg(not(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        )))]
         Err(Error::Unsupported)
     }
 
     pub async fn stop(&self) -> Result<StopOutcome, Error> {
+        #[cfg(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        ))]
+        return self.controller.native.stop().await;
+        #[cfg(not(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        )))]
         Err(Error::Unsupported)
     }
 
@@ -279,12 +369,13 @@ impl<M, P: Platform> DaemonClient<M, P> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Instance<M> {
     id: InstanceId,
     generation: GenerationId,
     summary: InstanceSummary,
     service_endpoint: Option<PublishedEndpoint>,
+    controller: Controller<DefaultPlatform>,
     _mode: PhantomData<fn() -> M>,
 }
 
@@ -301,11 +392,51 @@ impl<M> Instance<M> {
         &self.summary
     }
 
+    #[allow(clippy::needless_return)]
     pub async fn status(&self) -> Result<GenerationStatus, Error> {
+        #[cfg(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        ))]
+        {
+            let observed = self.controller.native.attach().await?;
+            let Some(observed) = observed else {
+                return Ok(GenerationStatus::Exited);
+            };
+            if observed.record.generation != self.generation {
+                return Err(Error::GenerationChanged {
+                    expected: self.generation,
+                    observed: Some(observed.record.generation),
+                });
+            }
+            return Ok(match observed.record.state {
+                crate::LifecycleState::Ready => GenerationStatus::Ready,
+                crate::LifecycleState::Quiescing => GenerationStatus::Quiescing,
+                crate::LifecycleState::Stopping => GenerationStatus::Stopping,
+                _ => GenerationStatus::Exited,
+            });
+        }
+        #[cfg(not(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        )))]
         Err(Error::Unsupported)
     }
 
     pub async fn stop(self) -> Result<StopOutcome, Error> {
+        #[cfg(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        ))]
+        return self.controller.native.stop_expected(self.generation).await;
+        #[cfg(not(all(
+            feature = "runtime-tokio",
+            feature = "native-process",
+            feature = "native-transport"
+        )))]
         Err(Error::Unsupported)
     }
 }
@@ -313,7 +444,62 @@ impl<M> Instance<M> {
 impl Instance<crate::Embedded> {
     #[cfg(feature = "runtime-tokio")]
     pub async fn connect(&self) -> Result<AuthenticatedStream, Error> {
+        #[cfg(all(feature = "native-process", feature = "native-transport"))]
+        {
+            let observed = self
+                .controller
+                .native
+                .attach()
+                .await?
+                .ok_or(Error::Unavailable {
+                    generation: Some(self.generation),
+                })?;
+            if observed.record.generation != self.generation {
+                return Err(Error::GenerationChanged {
+                    expected: self.generation,
+                    observed: Some(observed.record.generation),
+                });
+            }
+            return self
+                .controller
+                .native
+                .connect_application(&observed.record)
+                .await
+                .map(|stream| stream.into_authenticated());
+        }
+        #[cfg(not(all(feature = "native-process", feature = "native-transport")))]
         Err(Error::Unsupported)
+    }
+}
+
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "native-process",
+    feature = "native-transport"
+))]
+fn instance_from_native<M>(
+    controller: Controller<DefaultPlatform>,
+    native: crate::native::lifecycle::NativeInstance,
+) -> Instance<M> {
+    let service_endpoint = native
+        .record
+        .service_endpoint
+        .clone()
+        .map(|endpoint| match endpoint {
+            crate::record::ServiceEndpointRecord::Tcp(value) => PublishedEndpoint::Tcp(value),
+            crate::record::ServiceEndpointRecord::Path(value) => PublishedEndpoint::Path(value),
+            crate::record::ServiceEndpointRecord::Opaque(value) => PublishedEndpoint::Opaque(value),
+        });
+    Instance {
+        id: native.instance_id,
+        generation: native.record.generation,
+        summary: InstanceSummary {
+            generation: native.record.generation,
+            process_id: native.record.process_id,
+        },
+        service_endpoint,
+        controller,
+        _mode: PhantomData,
     }
 }
 
@@ -393,7 +579,26 @@ impl InstancePaths<'_> {
 }
 
 #[cfg(feature = "runtime-tokio")]
-pub struct AuthenticatedStream(tokio::io::DuplexStream);
+pub trait TransportIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl<T> TransportIo for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub struct AuthenticatedStream(std::pin::Pin<Box<dyn TransportIo>>);
+
+#[cfg(feature = "runtime-tokio")]
+impl AuthenticatedStream {
+    pub(crate) fn from_stream(stream: impl TransportIo) -> Self {
+        Self(Box::pin(stream))
+    }
+}
 
 #[cfg(feature = "runtime-tokio")]
 impl tokio::io::AsyncRead for AuthenticatedStream {
@@ -402,7 +607,7 @@ impl tokio::io::AsyncRead for AuthenticatedStream {
         context: &mut std::task::Context<'_>,
         buffer: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(context, buffer)
+        self.0.as_mut().poll_read(context, buffer)
     }
 }
 
@@ -413,21 +618,21 @@ impl tokio::io::AsyncWrite for AuthenticatedStream {
         context: &mut std::task::Context<'_>,
         buffer: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.0).poll_write(context, buffer)
+        self.0.as_mut().poll_write(context, buffer)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(context)
+        self.0.as_mut().poll_flush(context)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(context)
+        self.0.as_mut().poll_shutdown(context)
     }
 }
 
@@ -449,6 +654,23 @@ mod tests {
         assert!(!debug.contains("canary-argument"));
         assert!(!debug.contains("canary-environment"));
         assert!(debug.contains("visible"));
+    }
+
+    #[test]
+    fn public_daemon_constructors_reject_reserved_bootstrap_environment() {
+        for key in [
+            "DAEMONKIT_PRIVATE_BOOTSTRAP",
+            "daemonkit_private_bootstrap_nonce",
+        ] {
+            let error = match Daemon::embedded(
+                DaemonSpec::new("com.example.reserved-env").unwrap(),
+                Spawn::program("worker").env(key, "attacker-controlled"),
+            ) {
+                Ok(_) => panic!("reserved bootstrap environment was accepted"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, crate::ConfigError::ReservedEnvironment(_)));
+        }
     }
 
     #[test]

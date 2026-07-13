@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -24,6 +24,8 @@ pub enum ConfigError {
     CurrentExecutable(String),
     #[error("spawn program cannot be empty")]
     EmptyProgram,
+    #[error("spawn environment key is reserved by daemonkit: {0:?}")]
+    ReservedEnvironment(OsString),
 }
 
 fn validate_id(value: &str, reverse_dns: bool) -> Result<(), ConfigError> {
@@ -46,6 +48,12 @@ fn validate_id(value: &str, reverse_dns: bool) -> Result<(), ConfigError> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AppId(String);
 
+impl AppId {
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        authority_digest(b"app", self.0.as_bytes())
+    }
+}
+
 impl TryFrom<&str> for AppId {
     type Error = ConfigError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -63,6 +71,12 @@ impl TryFrom<String> for AppId {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IsolationId(String);
+
+impl IsolationId {
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        authority_digest(b"isolation", self.0.as_bytes())
+    }
+}
 
 impl TryFrom<&str> for IsolationId {
     type Error = ConfigError;
@@ -190,6 +204,13 @@ impl ProtocolRange {
         }
         Ok(Self { minimum, maximum })
     }
+
+    pub(crate) fn minimum(&self) -> u16 {
+        self.minimum
+    }
+    pub(crate) fn maximum(&self) -> u16 {
+        self.maximum
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +231,19 @@ fn digest(kind: &str, bytes: &[u8]) -> KeyDigest {
     hash.update([0]);
     hash.update(bytes);
     KeyDigest(hash.finalize().into())
+}
+
+fn authority_digest(kind: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"daemonkit:authority:v1\0");
+    hash.update(kind);
+    hash.update([0]);
+    hash.update(bytes);
+    hash.finalize().into()
+}
+
+pub(crate) fn default_isolation_digest() -> [u8; 32] {
+    authority_digest(b"isolation", b"default")
 }
 
 #[derive(Clone, Copy, Debug, Default)]

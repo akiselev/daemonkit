@@ -31,6 +31,7 @@ impl VerifiedRoot {
     }
 }
 
+#[cfg(unix)]
 fn default_root() -> Result<PathBuf, RootError> {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         let runtime = PathBuf::from(runtime);
@@ -40,6 +41,16 @@ fn default_root() -> Result<PathBuf, RootError> {
     }
     let home = std::env::var_os("HOME").ok_or(RootError::NoRuntimeLocation)?;
     Ok(PathBuf::from(home).join(".cache").join("daemonkit"))
+}
+
+#[cfg(windows)]
+fn default_root() -> Result<PathBuf, RootError> {
+    let local = std::env::var_os("LOCALAPPDATA").ok_or(RootError::NoRuntimeLocation)?;
+    let local = PathBuf::from(local);
+    if !local.is_absolute() {
+        return Err(RootError::NoRuntimeLocation);
+    }
+    Ok(local.join("daemonkit").join("runtime"))
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), RootError> {
@@ -77,7 +88,7 @@ fn create_private(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn create_private(path: &Path) -> io::Result<()> {
-    fs::create_dir(path)
+    windows::create_private_directory(path)
 }
 
 #[cfg(unix)]
@@ -125,11 +136,214 @@ fn verify_private_directory(path: &Path) -> Result<(), RootError> {
             reason: "not a real directory".into(),
         });
     }
-    // Ordinary metadata cannot prove the DACL is current-logon-only. Stay
-    // fail-closed until the windows-sys ACL verifier is implemented.
-    Err(RootError::UnsupportedSecurityPolicy {
+    windows::verify_private_directory_acl(path).map_err(|source| RootError::Io {
         path: path.to_owned(),
+        source,
     })
+}
+
+#[cfg(windows)]
+pub(crate) mod windows {
+    use super::*;
+    use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE},
+        Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        Security::{
+            AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation,
+            GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl,
+            InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+            SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+            ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+            OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        },
+        Storage::FileSystem::{CreateDirectoryW, FILE_ALL_ACCESS},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    const ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    /// Aligned storage for a TOKEN_USER response. The SID pointer refers into
+    /// this allocation, so callers must keep the value alive while using it.
+    struct CurrentUserSid {
+        _storage: Vec<usize>,
+        sid: PSID,
+    }
+
+    impl CurrentUserSid {
+        fn query() -> io::Result<Self> {
+            let mut token: HANDLE = ptr::null_mut();
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let result = (|| {
+                let mut bytes = 0u32;
+                unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut bytes) };
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                    return Err(error);
+                }
+                let words = (bytes as usize).div_ceil(mem::size_of::<usize>());
+                let mut storage = vec![0usize; words];
+                if unsafe {
+                    GetTokenInformation(
+                        token,
+                        TokenUser,
+                        storage.as_mut_ptr().cast(),
+                        bytes,
+                        &mut bytes,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+                Ok(Self {
+                    sid: user.User.Sid,
+                    _storage: storage,
+                })
+            })();
+            unsafe { CloseHandle(token) };
+            result
+        }
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
+        with_current_user_security(|attributes| {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { CreateDirectoryW(wide.as_ptr(), attributes) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Build current-logon-only security attributes and keep every referenced
+    /// allocation alive for the duration of the native object creation call.
+    pub(crate) fn with_current_user_security<T>(
+        create: impl FnOnce(*const SECURITY_ATTRIBUTES) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let user = CurrentUserSid::query()?;
+        let sid_bytes = unsafe { GetLengthSid(user.sid) } as usize;
+        if sid_bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let acl_bytes = mem::size_of::<ACL>() + mem::size_of::<ACCESS_ALLOWED_ACE>()
+            - mem::size_of::<u32>()
+            + sid_bytes;
+        let mut acl_storage = vec![0u32; acl_bytes.div_ceil(mem::size_of::<u32>())];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        if unsafe { InitializeAcl(acl, acl_bytes as u32, ACL_REVISION) } == 0
+            || unsafe {
+                AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                    FILE_ALL_ACCESS,
+                    user.sid,
+                )
+            } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+        let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast::<c_void>();
+        if unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) }
+            == 0
+            || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, acl, 0) } == 0
+            || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, user.sid, 0) } == 0
+            || unsafe {
+                SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+            } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor_ptr,
+            bInheritHandle: 0,
+        };
+        create(&attributes)
+    }
+
+    pub(super) fn verify_private_directory_acl(path: &Path) -> io::Result<()> {
+        let user = CurrentUserSid::query()?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner: PSID = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if result != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        let checked = (|| {
+            if owner.is_null() || unsafe { EqualSid(owner, user.sid) } == 0 {
+                return Err(unsafe_acl("directory owner is not the current logon SID"));
+            }
+            if dacl.is_null() {
+                return Err(unsafe_acl("directory has a null or absent DACL"));
+            }
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if control & SE_DACL_PROTECTED == 0 {
+                return Err(unsafe_acl("directory DACL inherits authority"));
+            }
+            let mut info = ACL_SIZE_INFORMATION::default();
+            if unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if info.AceCount == 0 {
+                return Err(unsafe_acl("directory DACL grants no current-user access"));
+            }
+            for index in 0..info.AceCount {
+                let mut raw_ace: *mut c_void = ptr::null_mut();
+                if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+                if ace.Header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE {
+                    return Err(unsafe_acl("directory DACL contains a non-allow ACE"));
+                }
+                let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+                if unsafe { EqualSid(sid, user.sid) } == 0 {
+                    return Err(unsafe_acl("directory DACL grants another identity access"));
+                }
+            }
+            Ok(())
+        })();
+        unsafe { LocalFree(descriptor) };
+        checked
+    }
+
+    fn unsafe_acl(reason: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, reason)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -144,9 +358,6 @@ pub(crate) enum RootError {
         #[source]
         source: io::Error,
     },
-    #[cfg(windows)]
-    #[error("runtime-root ACL verification is not implemented for {path:?}")]
-    UnsupportedSecurityPolicy { path: PathBuf },
 }
 
 #[cfg(test)]
@@ -160,6 +371,19 @@ mod tests {
         let verified = VerifiedRoot::open(Some(&root)).unwrap();
         assert_eq!(verified.path(), root.as_path());
         verified.reverify().unwrap();
+    }
+
+    #[test]
+    fn rejects_a_regular_file_as_runtime_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("runtime");
+        fs::write(&path, b"not-a-directory").unwrap();
+        let root = RuntimeRoot::new(&path).unwrap();
+        assert!(matches!(
+            VerifiedRoot::open(Some(&root)),
+            Err(RootError::Unsafe { .. })
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"not-a-directory");
     }
 
     #[cfg(unix)]
@@ -195,5 +419,23 @@ mod tests {
             VerifiedRoot::open(Some(&root)),
             Err(RootError::Unsafe { .. })
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_an_inherited_acl_without_repairing_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("runtime");
+        fs::create_dir(&path).unwrap();
+        let root = RuntimeRoot::new(&path).unwrap();
+        assert!(matches!(
+            VerifiedRoot::open(Some(&root)),
+            Err(RootError::Io { source, .. })
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(
+            path.is_dir(),
+            "verification must not replace an unsafe root"
+        );
     }
 }
