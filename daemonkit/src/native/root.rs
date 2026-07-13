@@ -153,10 +153,10 @@ pub(crate) mod windows {
             AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation,
             GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl,
             InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-            TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
-            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-            SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+            SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+            ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+            OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{CreateDirectoryW, FILE_ALL_ACCESS},
         System::Threading::{GetCurrentProcess, OpenProcessToken},
@@ -254,6 +254,7 @@ pub(crate) mod windows {
         if unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) }
             == 0
             || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, acl, 0) } == 0
+            || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, user.sid, 0) } == 0
             || unsafe {
                 SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
             } == 0

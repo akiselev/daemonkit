@@ -50,7 +50,7 @@ impl StableLock {
                         path: self.path.clone(),
                     })
                 }
-                Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                Err(source) if lock_is_contended(&source) => {
                     if started.elapsed() >= timeout {
                         return Err(LockError::Timeout {
                             path: self.path.clone(),
@@ -68,6 +68,14 @@ impl StableLock {
             }
         }
     }
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    // fs2 deliberately exposes the native contention error. On Unix it maps to
+    // WouldBlock; on Windows ERROR_LOCK_VIOLATION maps to a different ErrorKind.
+    // Comparing the raw code preserves one portable timeout/cancellation policy.
+    error.kind() == io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 fn open_stable(path: &Path) -> io::Result<File> {
