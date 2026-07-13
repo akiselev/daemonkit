@@ -48,7 +48,8 @@ supervised managed children; the cross-platform CI matrix is active and passing.
 ## Next
 
 Release preparation: public README, crate READMEs, usage/security guide, and
-release checklist are complete for `0.1.0`; tag-triggered publishing and the
-GitHub release remain intentionally paused pending final release workflow
-review. After that: Phase 5 platform/race/security/resource hardening,
-benchmarks, and debugger-cli/ghidra-cli migration spikes.
+release checklist are complete for `0.1.0`. The tag-triggered workflow reruns
+all release gates, publishes `daemonkit` before `daemonkit-testkit`, and only
+then creates the GitHub release; `v0.1.0` has not yet been created. After that:
+Phase 5 platform/race/security/resource hardening, benchmarks, and
+debugger-cli/ghidra-cli migration spikes.

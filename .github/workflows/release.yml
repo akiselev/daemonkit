@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Publishing is intentionally separate from ordinary branch CI. A tag reruns
+# every release gate against the immutable release source, and only then may
+# write to crates.io or create a GitHub Release.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  release-version:
+    name: Verify release tag and package version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require an exact v<workspace-version> tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+  quality:
+    name: Format, lint, and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Build rustdoc with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --locked --no-deps
+
+  msrv:
+    name: MSRV 1.81
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: release-msrv
+      - run: cargo check --workspace --lib --all-features --locked
+
+  features:
+    name: Features (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core-only
+            args: --no-default-features
+          - name: tokio-only
+            args: --no-default-features --features runtime-tokio
+          - name: native-async
+            args: --no-default-features --features runtime-tokio,native-process,native-transport
+          - name: blocking-native
+            args: --no-default-features --features blocking,native-process,native-transport
+          - name: advanced-native
+            args: --no-default-features --features advanced,runtime-tokio,native-process,native-transport
+          - name: all
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: release-features-${{ matrix.name }}
+      - run: cargo check --workspace --all-targets --locked ${{ matrix.args }}
+      - run: cargo test -p daemonkit --lib --locked ${{ matrix.args }}
+
+  native-platform:
+    name: Native contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: release-native-${{ matrix.os }}
+      - run: cargo test -p daemonkit --all-features --lib --locked -- --nocapture
+      - run: cargo test -p daemonkit --all-features --test native_lifecycle --locked -- --nocapture --test-threads=1
+      - run: cargo test -p daemonkit-testkit --all-features --locked -- --nocapture
+
+  compile-api:
+    name: Public API compile contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo test -p daemonkit --all-features --test compile --locked -- --nocapture
+
+  lifecycle-stress:
+    name: Repeated real-process lifecycle stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: release-lifecycle-stress
+      - name: Repeat cancellation, crash, and tree-cleanup contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            cargo test -p daemonkit --all-features --test native_lifecycle --locked -- --nocapture --test-threads=1
+          done
+
+  package:
+    name: Publishable package contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo package -p daemonkit --locked
+      - run: cargo package -p daemonkit-testkit --locked --list
+
+  audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish crates.io packages
+    needs:
+      - release-version
+      - quality
+      - msrv
+      - features
+      - native-platform
+      - compile-api
+      - lifecycle-stress
+      - package
+      - audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish daemonkit first
+        run: cargo publish -p daemonkit --locked --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish daemonkit-testkit after registry propagation
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if cargo publish -p daemonkit-testkit --locked --token "$CARGO_REGISTRY_TOKEN"; then
+              exit 0
+            fi
+            if [ "$attempt" = 6 ]; then
+              exit 1
+            fi
+            sleep 20
+          done
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
