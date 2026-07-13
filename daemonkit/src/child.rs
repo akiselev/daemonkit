@@ -179,6 +179,7 @@ impl Bootstrap {
                     // pipes. Ownership outlives the direct child handle.
                     force_managed(&mut managed, child.tree_policy).await?;
                 }
+                managed.release_tree().await;
                 control_task.abort();
                 managed.finish_output().await;
                 if status.success() {
@@ -192,6 +193,7 @@ impl Bootstrap {
             Completion::Shutdown => {
                 state.store(STATE_STOPPING, Ordering::SeqCst);
                 terminate_managed(&mut managed, &child.shutdown, child.tree_policy).await?;
+                managed.release_tree().await;
                 control_task.abort();
                 managed.finish_output().await;
                 Ok(())
@@ -485,6 +487,8 @@ struct ManagedRuntime {
     stderr_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
     #[cfg(windows)]
     job: WindowsJob,
+    #[cfg(unix)]
+    watchdog: Option<UnixWatchdog>,
 }
 
 impl ManagedRuntime {
@@ -503,6 +507,13 @@ impl ManagedRuntime {
             }
         }
     }
+
+    async fn release_tree(&mut self) {
+        #[cfg(unix)]
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.finish().await;
+        }
+    }
 }
 
 async fn start_managed(
@@ -518,7 +529,7 @@ async fn start_managed(
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
-    command.creation_flags(0x0000_0200 | 0x0800_0000); // NEW_PROCESS_GROUP | NO_WINDOW
+    command.creation_flags(0x0000_0004 | 0x0000_0200 | 0x0800_0000); // SUSPENDED | NEW_PROCESS_GROUP | NO_WINDOW
 
     let mut process = command.spawn().map_err(bootstrap_error)?;
     #[cfg(unix)]
@@ -527,6 +538,15 @@ async fn start_managed(
         .ok_or_else(|| bootstrap_error("managed child has no process id"))?;
     #[cfg(windows)]
     let job = WindowsJob::assign(&process).map_err(bootstrap_error)?;
+    #[cfg(windows)]
+    job.resume(&process).map_err(bootstrap_error)?;
+    #[cfg(unix)]
+    let watchdog = match config.tree_policy {
+        ProcessTreePolicy::OwnedTree => {
+            Some(UnixWatchdog::spawn(process_id).map_err(bootstrap_error)?)
+        }
+        ProcessTreePolicy::DirectChildOnly => None,
+    };
 
     let stdout = process
         .stdout
@@ -569,8 +589,11 @@ async fn start_managed(
             stderr_task: Some(stderr_task),
             #[cfg(windows)]
             job,
+            #[cfg(unix)]
+            watchdog,
         };
         let _ = force_managed(&mut runtime, config.tree_policy).await;
+        runtime.release_tree().await;
         runtime.finish_output().await;
         return Err(error);
     }
@@ -583,6 +606,8 @@ async fn start_managed(
             stderr_task: Some(stderr_task),
             #[cfg(windows)]
             job,
+            #[cfg(unix)]
+            watchdog,
         },
         result.expect("readiness result checked above"),
     ))
@@ -890,12 +915,130 @@ impl WindowsJob {
             Ok(())
         }
     }
+
+    fn resume(&self, child: &Child) -> io::Result<()> {
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtResumeProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
+        }
+        let handle = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "child handle is closed"))?;
+        let status = unsafe { NtResumeProcess(handle as _) };
+        if status < 0 {
+            Err(io::Error::other(format!(
+                "NtResumeProcess failed with NTSTATUS 0x{:08x}",
+                status as u32
+            )))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for WindowsJob {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// A tiny detached reaper closes Unix's supervisor-crash gap. It owns no
+/// application descriptors: EOF on its private pipe means the supervisor died
+/// or deliberately released ownership, at which point it kills the verified
+/// managed process group and exits.
+#[cfg(unix)]
+struct UnixWatchdog {
+    writer: libc::c_int,
+    process_id: libc::pid_t,
+}
+
+#[cfg(unix)]
+impl UnixWatchdog {
+    fn spawn(process_id: u32) -> io::Result<Self> {
+        let mut pipe = [-1; 2];
+        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for descriptor in pipe {
+            if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                }
+                return Err(error);
+            }
+        }
+        let maximum_descriptor = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let maximum_descriptor = if maximum_descriptor > 0 {
+            maximum_descriptor.min(65_536) as libc::c_int
+        } else {
+            1024
+        };
+        let watchdog = unsafe { libc::fork() };
+        if watchdog == -1 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            return Err(error);
+        }
+        if watchdog == 0 {
+            unsafe {
+                libc::close(pipe[1]);
+                // Escape the supervisor's group so an external group kill does
+                // not race the watchdog before it can clean the managed group.
+                let _ = libc::setsid();
+                for descriptor in 0..maximum_descriptor {
+                    if descriptor != pipe[0] {
+                        libc::close(descriptor);
+                    }
+                }
+                let mut byte = 0_u8;
+                loop {
+                    let result = libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                    if result == 0 {
+                        break;
+                    }
+                    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break;
+                    }
+                }
+                let _ = libc::kill(-(process_id as libc::pid_t), libc::SIGKILL);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(pipe[0]) };
+        Ok(Self {
+            writer: pipe[1],
+            process_id: watchdog,
+        })
+    }
+
+    async fn finish(mut self) {
+        self.close_writer();
+        let process_id = self.process_id;
+        let _ = tokio::task::spawn_blocking(move || unsafe {
+            libc::waitpid(process_id, std::ptr::null_mut(), 0)
+        })
+        .await;
+    }
+
+    fn close_writer(&mut self) {
+        if self.writer >= 0 {
+            unsafe { libc::close(self.writer) };
+            self.writer = -1;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixWatchdog {
+    fn drop(&mut self) {
+        self.close_writer();
     }
 }
 

@@ -302,6 +302,40 @@ async fn managed_supervisor_publishes_readiness_drains_output_and_kills_tree() {
     wait_until_process_gone(descendant).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_supervisor_crash_still_kills_owned_descendants() {
+    if Bootstrap::detect().unwrap().is_some() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let root = RuntimeRoot::new(state.path().join("runtime")).unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = reservation.local_addr().unwrap();
+    drop(reservation);
+    let grandchild_pid = state.path().join("crash-grandchild.pid");
+    let daemon = Daemon::managed(
+        DaemonSpec::new("com.example.managed-supervisor-crash")
+            .unwrap()
+            .runtime_root(root.clone())
+            .startup_timeout(Duration::from_secs(10)),
+        fixture_spawn()
+            .env("DAEMONKIT_TEST_MANAGED", "1")
+            .env("DAEMONKIT_TEST_MANAGED_ENDPOINT", endpoint.to_string())
+            .env("DAEMONKIT_TEST_GRANDCHILD_PID", &grandchild_pid),
+    )
+    .unwrap();
+    daemon.ensure().await.unwrap();
+    let descendant = wait_for_pid(&grandchild_pid).await;
+    let supervisor = instance_process_id(root.as_path());
+
+    terminate_process(supervisor);
+    wait_until_process_gone(descendant).await;
+    assert!(matches!(
+        daemon.repair().await.unwrap(),
+        RepairOutcome::Repaired { .. }
+    ));
+}
+
 async fn wait_for_pid(path: &std::path::Path) -> u32 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -360,6 +394,29 @@ fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn instance_process_id(root: &std::path::Path) -> u32 {
+    let record = find_file(root, "instance.json").unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    value["process_id"].as_u64().unwrap() as u32
+}
+
+#[cfg(unix)]
+fn terminate_process(process_id: u32) {
+    assert_eq!(unsafe { libc::kill(process_id as i32, libc::SIGKILL) }, 0);
+}
+
+#[cfg(windows)]
+fn terminate_process(process_id: u32) {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+    };
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, process_id) };
+    assert!(!handle.is_null());
+    assert_ne!(unsafe { TerminateProcess(handle, 1) }, 0);
+    unsafe { CloseHandle(handle) };
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
