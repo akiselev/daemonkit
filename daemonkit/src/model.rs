@@ -1,9 +1,29 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// Stable generation identity. A new value is required for every startup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GenerationId(pub u128);
+
+impl Serialize for GenerationId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{:032x}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for GenerationId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom(
+                "generation must be 32 hexadecimal digits",
+            ));
+        }
+        u128::from_str_radix(&value, 16)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// Lifecycle states visible to the deterministic kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

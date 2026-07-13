@@ -12,6 +12,7 @@ use super::{root::VerifiedRoot, store::AtomicStore};
 /// Human-readable key metadata never participates in these paths.
 #[derive(Clone, Debug)]
 pub(crate) struct InstanceLayout {
+    root: PathBuf,
     directory: PathBuf,
 }
 
@@ -29,11 +30,29 @@ impl InstanceLayout {
             .join(hex(&key_digest.0))
             .join(hex(&isolation_digest));
         create_private_tree(root.path(), &directory)?;
-        Ok(Self { directory })
+        Ok(Self {
+            root: root.path().to_owned(),
+            directory,
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.directory
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn control_endpoint_path(
+        &self,
+        instance: &crate::InstanceId,
+        generation: GenerationId,
+    ) -> Result<PathBuf, LayoutError> {
+        let sockets = self.root.join("s");
+        create_private(&sockets)?;
+        Ok(sockets.join(format!(
+            "{}-{:016x}.sock",
+            hex(&instance.0[..8]),
+            generation.0 as u64
+        )))
     }
 
     pub(crate) fn lifecycle_lock(&self) -> super::locks::StableLock {

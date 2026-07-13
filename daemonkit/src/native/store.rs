@@ -63,6 +63,25 @@ impl AtomicStore {
         self.publish_with_fault(bytes, None)
     }
 
+    pub(crate) fn clear(&self) -> Result<(), StoreError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                if let Some(parent) = self.path.parent() {
+                    sync_parent(parent).map_err(|source| StoreError::Io {
+                        path: parent.to_owned(),
+                        source,
+                    })?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StoreError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+
     pub(crate) fn publish_with_fault(
         &self,
         bytes: &[u8],

@@ -1,6 +1,7 @@
 # Status
 
-Phases 0-2 are implemented. Phase 3 bootstrap and embedded lifecycle is next.
+Phases 0-2 are implemented. Phase 3 bootstrap and embedded lifecycle is in
+progress; the native transactional embedded path now runs end to end.
 
 ## Latest
 
@@ -94,14 +95,29 @@ Phases 0-2 are implemented. Phase 3 bootstrap and embedded lifecycle is next.
   streams and accept-capable listeners. `AuthenticatedStream` now erases native
   or custom transports without exposing backend traits. Native UDS and Windows
   pipe tests run the real authenticated handshake before application echo.
+- Implemented the portable inherited bootstrap transaction: a private piped
+  stdin carries launch/commit, stdout/stderr are captured from first spawn,
+  endpoint authentication proves `Prepared`, and the child cannot serve before
+  `Commit`. EOF or cancellation kills and asynchronously cleans an uncommitted
+  child, matching record, and generation directory.
+- Wired the parent facade to real native ensure/attach/status/connect/stop/
+  restart/repair operations. Fifty cold concurrent ensures serialize through
+  the stable lock and reuse one generation; final-endpoint identity is checked
+  against the typed record before every handle is returned. Graceful stop is
+  idempotent and waits for the child-held lease before owned cleanup.
+- Added a real-process embedded fixture covering authenticated byte echo,
+  cancellation after spawn, recovery, repeated ensure, and repeated stop. UDS
+  endpoints now use a short verified-root socket namespace so long digest-based
+  instance paths remain within the portable Unix path budget.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
-- Current local gates pass: 55 unit tests, seven compile API cases, one doctest,
+- Current local gates pass: 58 unit/integration tests, seven compile API cases,
+  one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Begin Phase 3: inherited bootstrap channel, deliberate spawn/detachment and
-stdio capture, prepared/publish/commit orchestration, cancellation rollback,
-compatibility/stale repair, and embedded service shutdown/idle behavior.
-Native Windows/macOS execution remains CI evidence, not local evidence.
+Continue Phase 3: add idle shutdown/race handling, richer startup diagnostics,
+compatibility and stale-repair real-process cases, and the remaining
+interruption-matrix schedules before closing the phase. Native Windows/macOS
+execution remains CI evidence, not local evidence.
