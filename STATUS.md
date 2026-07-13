@@ -1,7 +1,7 @@
 # Status
 
-Phase 0 is complete. Phase 1 identity/root/lock/store implementation is complete
-and its native contract suite is wired for Linux, macOS, and Windows CI.
+Phases 0-1 are complete. Phase 2 authenticated control and native transport is
+in progress; the shared binary handshake contract is implemented.
 
 ## Latest
 
@@ -76,13 +76,18 @@ and its native contract suite is wired for Linux, macOS, and Windows CI.
   protected, inheritable current-logon-only DACLs. Reverification checks the
   owner SID, protected-DACL flag, and every granting ACE; unsafe roots fail
   closed. Added a three-OS GitHub Actions test matrix plus format/lint/docs gate.
+- Added strict 64 KiB length-delimited binary framing, partial-I/O-safe reads,
+  whole-handshake deadlines, highest-overlap protocol negotiation, role and
+  capability exchange, constant-time token comparison, and uniform rejection
+  of app/key/isolation/generation/token/protocol mismatches. Application-role
+  tests prove that bytes are transparent immediately after authentication.
 - Cross-compilation checks pass for Linux, macOS (`x86_64-apple-darwin`), and
   Windows (`x86_64-pc-windows-gnu`); native runtime tests have only run on Linux.
-- Current gates pass: 43 unit tests, seven compile API cases, one doctest,
+- Current gates pass: 48 unit tests, seven compile API cases, one doctest,
   formatting, strict Clippy, rustdoc, and `git diff --check`.
 
 ## Next
 
-Begin Phase 2: native UDS/secured named-pipe transport, bounded authenticated
-control framing, negotiation, control roles, and transparent application stream
-handoff. Native Windows/macOS execution remains CI evidence, not local evidence.
+Continue Phase 2: implement UDS and secured named-pipe listeners/connectors,
+then control request/response state and object-safe custom transport adaptation.
+Native Windows/macOS execution remains CI evidence, not local evidence.
