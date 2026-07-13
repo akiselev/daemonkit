@@ -229,6 +229,7 @@ mod windows_tests {
             config: [8; 32],
             state: 3,
             capabilities: Capabilities::APPLICATION_STREAM,
+            service_endpoint: None,
         }
     }
 
@@ -419,6 +420,7 @@ mod tests {
             config: [8; 32],
             state: 3,
             capabilities: Capabilities::APPLICATION_STREAM,
+            service_endpoint: None,
         }
     }
 

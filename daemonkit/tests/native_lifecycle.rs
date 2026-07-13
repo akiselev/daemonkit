@@ -5,11 +5,12 @@
 ))]
 
 use daemonkit::{
-    Bootstrap, Compatibility, ConfigFingerprint, Daemon, DaemonSpec, InstanceStatus, RepairOutcome,
-    RuntimeRoot, Spawn,
+    Bootstrap, Compatibility, ConfigFingerprint, Daemon, DaemonSpec, EndpointPublication,
+    InstanceStatus, ManagedChild, PublishedEndpoint, Readiness, ReadinessResult, RepairOutcome,
+    RuntimeRoot, ShutdownStrategy, Spawn,
 };
 use futures_core::Stream;
-use std::{sync::Arc, time::Duration};
+use std::{io::Write as _, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -23,6 +24,51 @@ fn lifecycle_fixture_child() {
     let Some(bootstrap) = Bootstrap::detect().unwrap() else {
         return;
     };
+    if std::env::var_os("DAEMONKIT_TEST_MANAGED").is_some() {
+        let endpoint: SocketAddr = std::env::var("DAEMONKIT_TEST_MANAGED_ENDPOINT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = ManagedChild::new(executable)
+            .args(["--exact", "managed_program_fixture", "--nocapture"])
+            .env("DAEMONKIT_TEST_MANAGED_PROGRAM", "1")
+            .env("DAEMONKIT_TEST_MANAGED_ENDPOINT", endpoint.to_string())
+            .readiness(Readiness::custom(move |mut context| async move {
+                let mut observed = Vec::new();
+                while let Some(chunk) = std::future::poll_fn(|poll| {
+                    std::pin::Pin::new(context.stdout()).poll_next(poll)
+                })
+                .await
+                {
+                    observed.extend_from_slice(&chunk);
+                    if String::from_utf8_lossy(&observed).contains(&format!("READY {endpoint}")) {
+                        return Ok::<_, std::io::Error>(
+                            ReadinessResult::ready().service_endpoint(endpoint),
+                        );
+                    }
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "managed stdout closed before readiness",
+                ))
+            }))
+            .service_endpoint(EndpointPublication::from_readiness())
+            .shutdown(ShutdownStrategy::with_timeouts(
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            ));
+        if let Some(path) = std::env::var_os("DAEMONKIT_TEST_GRANDCHILD_PID") {
+            child = child.env("DAEMONKIT_TEST_GRANDCHILD_PID", path);
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(bootstrap.run_managed(child))
+            .unwrap();
+        return;
+    }
     let hold_stream = std::env::var_os("DAEMONKIT_TEST_HOLD_STREAM").is_some();
     let exit_after = std::env::var("DAEMONKIT_TEST_EXIT_AFTER_MS")
         .ok()
@@ -61,6 +107,44 @@ fn lifecycle_fixture_child() {
             Ok::<_, std::io::Error>(())
         }))
         .unwrap();
+}
+
+#[test]
+#[allow(clippy::zombie_processes)] // The supervisor deliberately kills this fixture's whole tree.
+fn managed_program_fixture() {
+    if std::env::var_os("DAEMONKIT_TEST_MANAGED_PROGRAM").is_none() {
+        return;
+    }
+    let endpoint: SocketAddr = std::env::var("DAEMONKIT_TEST_MANAGED_ENDPOINT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let _listener = std::net::TcpListener::bind(endpoint).unwrap();
+    let _grandchild = std::env::var_os("DAEMONKIT_TEST_GRANDCHILD_PID").map(|path| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "managed_grandchild_fixture", "--nocapture"])
+            .env("DAEMONKIT_TEST_GRANDCHILD_PID", path)
+            .spawn()
+            .unwrap()
+    });
+    let noise = vec![b'x'; 256 * 1024];
+    std::io::stdout().write_all(&noise).unwrap();
+    std::io::stderr().write_all(&noise).unwrap();
+    println!("\nREADY {endpoint}");
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn managed_grandchild_fixture() {
+    let Some(path) = std::env::var_os("DAEMONKIT_TEST_GRANDCHILD_PID") else {
+        return;
+    };
+    std::fs::write(path, std::process::id().to_string()).unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -176,6 +260,106 @@ fn fixture_spawn() -> Spawn {
         "lifecycle_fixture_child",
         "--nocapture",
     ])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_supervisor_publishes_readiness_drains_output_and_kills_tree() {
+    if Bootstrap::detect().unwrap().is_some() {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let root = RuntimeRoot::new(state.path().join("runtime")).unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = reservation.local_addr().unwrap();
+    drop(reservation);
+    let grandchild_pid = state.path().join("grandchild.pid");
+    let daemon = Daemon::managed(
+        DaemonSpec::new("com.example.managed-tree")
+            .unwrap()
+            .runtime_root(root.clone())
+            .startup_timeout(Duration::from_secs(10))
+            .shutdown_timeout(Duration::from_secs(10)),
+        fixture_spawn()
+            .env("DAEMONKIT_TEST_MANAGED", "1")
+            .env("DAEMONKIT_TEST_MANAGED_ENDPOINT", endpoint.to_string())
+            .env("DAEMONKIT_TEST_GRANDCHILD_PID", &grandchild_pid),
+    )
+    .unwrap();
+
+    let instance = daemon.ensure().await.unwrap();
+    assert_eq!(
+        instance.service_endpoint().unwrap(),
+        &PublishedEndpoint::Tcp(endpoint)
+    );
+    tokio::net::TcpStream::connect(endpoint).await.unwrap();
+    let descendant = wait_for_pid(&grandchild_pid).await;
+    let stdout_log = find_file(root.as_path(), "managed-stdout.log").unwrap();
+    let stderr_log = find_file(root.as_path(), "managed-stderr.log").unwrap();
+    assert!(std::fs::metadata(stdout_log).unwrap().len() >= 256 * 1024);
+    assert!(std::fs::metadata(stderr_log).unwrap().len() >= 256 * 1024);
+
+    daemon.stop().await.unwrap();
+    wait_until_process_gone(descendant).await;
+}
+
+async fn wait_for_pid(path: &std::path::Path) -> u32 {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(path) {
+                break value.parse().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn wait_until_process_gone(process_id: u32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process_exists(process_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn process_exists(process_id: u32) -> bool {
+    let result = unsafe { libc::kill(process_id as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_exists(process_id: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut code = 0;
+    let active = unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE;
+    unsafe { CloseHandle(handle) };
+    active
+}
+
+fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        if path.file_name().is_some_and(|value| value == name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

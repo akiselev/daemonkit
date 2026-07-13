@@ -12,7 +12,9 @@ use crate::{
         client_handshake, read_control_response, write_control_request, ClientHello,
         ConnectionRole, ControlMessage, ControlResponse, ProtocolRange,
     },
-    record::{ControlEndpointRecord, InstanceRecord, INSTANCE_RECORD_SCHEMA},
+    record::{
+        ControlEndpointRecord, InstanceRecord, ServiceEndpointRecord, INSTANCE_RECORD_SCHEMA,
+    },
     BinaryCompatibility, Compatibility, DaemonKey, DaemonSpec, Error, GenerationId, InstanceId,
     InstanceStatus, InstanceSummary, LifecycleState, LogPolicy, MismatchAction, RepairAction,
     RepairOutcome, RuntimeRoot, Spawn, StartupDiagnostics, StartupPhase, StopOutcome,
@@ -162,6 +164,7 @@ impl NativeController {
             idle_timeout_millis: self
                 .idle_timeout
                 .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
+            generation_directory: generation_layout.path().to_owned(),
         };
         write_bootstrap(&mut stdin, &BootstrapCommand::Launch(Box::new(launch)))
             .await
@@ -192,7 +195,7 @@ impl NativeController {
                     self.logs.tail_bytes,
                 )
             })?;
-        client_handshake(&mut prepared, &hello, self.startup_timeout)
+        let prepared_identity = client_handshake(&mut prepared, &hello, self.startup_timeout)
             .await
             .map_err(|error| {
                 startup_error(
@@ -219,7 +222,22 @@ impl NativeController {
             process_id: Some(process_id),
             process_identity: Some(process_identity),
             control_endpoint: endpoint_record(&endpoint),
-            service_endpoint: None,
+            service_endpoint: prepared_identity
+                .service_endpoint
+                .as_deref()
+                .map(serde_json::from_str::<ServiceEndpointRecord>)
+                .transpose()
+                .map_err(|error| {
+                    startup_error(
+                        spawn,
+                        layout,
+                        generation_layout.path(),
+                        Some(process_id),
+                        StartupPhase::Prepare,
+                        error,
+                        self.logs.tail_bytes,
+                    )
+                })?,
             protocol_minimum: self.compatibility.protocol.minimum(),
             protocol_maximum: self.compatibility.protocol.maximum(),
             build_fingerprint: requested_build(&self.compatibility),

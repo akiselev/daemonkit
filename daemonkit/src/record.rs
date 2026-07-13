@@ -12,6 +12,14 @@ pub(crate) enum ControlEndpointRecord {
     WindowsNamedPipe(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub(crate) enum ServiceEndpointRecord {
+    Tcp(std::net::SocketAddr),
+    Path(PathBuf),
+    Opaque(String),
+}
+
 /// Atomic discovery record. Possession of this value never proves liveness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,7 +33,7 @@ pub(crate) struct InstanceRecord {
     pub process_id: Option<u32>,
     pub process_identity: Option<Vec<u8>>,
     pub control_endpoint: ControlEndpointRecord,
-    pub service_endpoint: Option<String>,
+    pub service_endpoint: Option<ServiceEndpointRecord>,
     pub protocol_minimum: u16,
     pub protocol_maximum: u16,
     pub build_fingerprint: [u8; 32],

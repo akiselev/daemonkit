@@ -197,6 +197,7 @@ pub(crate) struct ServerIdentity {
     pub(crate) config: [u8; 32],
     pub(crate) state: u8,
     pub(crate) capabilities: Capabilities,
+    pub(crate) service_endpoint: Option<String>,
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -216,6 +217,7 @@ impl std::fmt::Debug for ServerIdentity {
             .field("config", &self.config)
             .field("state", &self.state)
             .field("capabilities", &self.capabilities)
+            .field("service_endpoint", &self.service_endpoint)
             .finish()
     }
 }
@@ -231,6 +233,7 @@ pub(crate) struct Negotiated {
     pub(crate) config: [u8; 32],
     pub(crate) state: u8,
     pub(crate) capabilities: Capabilities,
+    pub(crate) service_endpoint: Option<String>,
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -283,6 +286,7 @@ where
         config: identity.config,
         state: identity.state,
         capabilities: identity.capabilities,
+        service_endpoint: identity.service_endpoint.clone(),
     };
     write_frame(stream, &encode_server_hello(&negotiated)).await?;
     Ok((negotiated, hello.role))
@@ -482,6 +486,9 @@ fn encode_server_hello(hello: &Negotiated) -> Vec<u8> {
     bytes.extend_from_slice(&hello.config);
     bytes.push(hello.state);
     bytes.extend_from_slice(&hello.capabilities.0.to_be_bytes());
+    let endpoint = hello.service_endpoint.as_deref().unwrap_or("").as_bytes();
+    bytes.extend_from_slice(&(endpoint.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(endpoint);
     bytes
 }
 
@@ -499,15 +506,32 @@ fn decode_server_hello(bytes: &[u8]) -> Result<Negotiated, ProtocolError> {
         return Err(ProtocolError::Malformed("process identity is too large"));
     }
     let process_identity = decoder.bytes(identity_length)?.to_vec();
+    let build = decoder.array()?;
+    let config = decoder.array()?;
+    let state = decoder.byte()?;
+    let capabilities = Capabilities(u64::from_be_bytes(decoder.array()?));
+    let endpoint_length = u16::from_be_bytes(decoder.array()?) as usize;
+    if endpoint_length > 2048 {
+        return Err(ProtocolError::Malformed("service endpoint is too large"));
+    }
+    let service_endpoint = match decoder.bytes(endpoint_length)? {
+        [] => None,
+        bytes => Some(
+            std::str::from_utf8(bytes)
+                .map_err(|_| ProtocolError::Malformed("service endpoint is not UTF-8"))?
+                .to_owned(),
+        ),
+    };
     let negotiated = Negotiated {
         version,
         generation,
         process_id,
         process_identity,
-        build: decoder.array()?,
-        config: decoder.array()?,
-        state: decoder.byte()?,
-        capabilities: Capabilities(u64::from_be_bytes(decoder.array()?)),
+        build,
+        config,
+        state,
+        capabilities,
+        service_endpoint,
     };
     decoder.finish()?;
     if negotiated.version == 0 {
@@ -724,6 +748,7 @@ mod tests {
             capabilities: Capabilities::STATUS
                 .union(Capabilities::SHUTDOWN)
                 .union(Capabilities::APPLICATION_STREAM),
+            service_endpoint: None,
         }
     }
 

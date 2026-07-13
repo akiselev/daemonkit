@@ -87,7 +87,7 @@ impl Spawn {
         self
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.program.is_empty() {
             return Err(ConfigError::EmptyProgram);
         }
@@ -485,7 +485,11 @@ fn instance_from_native<M>(
         .record
         .service_endpoint
         .clone()
-        .map(PublishedEndpoint::Opaque);
+        .map(|endpoint| match endpoint {
+            crate::record::ServiceEndpointRecord::Tcp(value) => PublishedEndpoint::Tcp(value),
+            crate::record::ServiceEndpointRecord::Path(value) => PublishedEndpoint::Path(value),
+            crate::record::ServiceEndpointRecord::Opaque(value) => PublishedEndpoint::Opaque(value),
+        });
     Instance {
         id: native.instance_id,
         generation: native.record.generation,

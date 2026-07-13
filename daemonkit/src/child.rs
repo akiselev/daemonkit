@@ -12,6 +12,7 @@ use crate::{
 };
 use crate::{AuthenticatedStream, Error, PublishedEndpoint, Spawn};
 use futures_core::Stream;
+use std::io::Write as _;
 use std::sync::{
     atomic::{AtomicU8, AtomicUsize, Ordering},
     Arc,
@@ -19,6 +20,7 @@ use std::sync::{
 use std::{
     error::Error as StdError,
     ffi::OsString,
+    fs::OpenOptions,
     future::Future,
     io,
     net::SocketAddr,
@@ -27,7 +29,8 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::process::Child;
 
 /// Validated one-shot inherited bootstrap channel.
 pub struct Bootstrap {
@@ -76,9 +79,124 @@ impl Bootstrap {
         .await
     }
 
-    pub async fn run_managed(self, child: ManagedChild) -> Result<(), Error> {
-        let _ = child;
-        Err(Error::Unsupported)
+    pub async fn run_managed(self, mut child: ManagedChild) -> Result<(), Error> {
+        child.spawn.validate()?;
+        let mut input = tokio::io::stdin();
+        let launch =
+            match bootstrap::decode(&read_frame(&mut input).await.map_err(bootstrap_error)?)
+                .map_err(bootstrap_error)?
+            {
+                BootstrapCommand::Launch(launch) => launch,
+                BootstrapCommand::Commit { .. } => {
+                    return Err(bootstrap_error("commit before launch"))
+                }
+            };
+        if launch.version != BOOTSTRAP_VERSION || launch.nonce != self.nonce {
+            return Err(bootstrap_error("bootstrap version or nonce mismatch"));
+        }
+        let _lease = crate::native::locks::StableLock::new(&launch.lease_path)
+            .acquire(Duration::from_secs(10))
+            .map_err(bootstrap_error)?;
+
+        let (mut managed, readiness_result) = start_managed(&mut child, &launch).await?;
+        let endpoint = select_managed_endpoint(&child.endpoint, readiness_result)?;
+        let encoded_endpoint = endpoint
+            .as_ref()
+            .map(service_endpoint_record)
+            .map(|record| serde_json::to_string(&record))
+            .transpose()
+            .map_err(bootstrap_error)?;
+        if encoded_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.len() > 2048)
+        {
+            return Err(bootstrap_error("managed service endpoint is too large"));
+        }
+
+        let mut listener = NativeListener::bind(&launch.endpoint).map_err(bootstrap_error)?;
+        let mut identity = launch.server_identity(STATE_PUBLISHED);
+        identity.capabilities = crate::protocol::Capabilities::STATUS
+            .union(crate::protocol::Capabilities::DRAIN)
+            .union(crate::protocol::Capabilities::SHUTDOWN)
+            .union(crate::protocol::Capabilities::DIAGNOSTICS);
+        identity.service_endpoint = encoded_endpoint;
+        let (preparing, role) = {
+            let prepared = async {
+                let mut preparing = listener.accept().await.map_err(bootstrap_error)?;
+                let (_, role) =
+                    server_handshake(&mut preparing, &identity, Duration::from_secs(10))
+                        .await
+                        .map_err(bootstrap_error)?;
+                Ok::<_, Error>((preparing, role))
+            };
+            let early_commit = async {
+                let bytes = read_frame(&mut input).await.map_err(bootstrap_error)?;
+                bootstrap::decode(&bytes).map_err(bootstrap_error)
+            };
+            tokio::pin!(prepared);
+            tokio::pin!(early_commit);
+            tokio::select! {
+                prepared = &mut prepared => prepared?,
+                early = &mut early_commit => {
+                    let _ = early?;
+                    return Err(bootstrap_error("commit arrived before managed readiness authentication"));
+                }
+            }
+        };
+        if role != ConnectionRole::Control {
+            return Err(bootstrap_error(
+                "managed prepared probe used application role",
+            ));
+        }
+        drop(preparing);
+        let commit = bootstrap::decode(&read_frame(&mut input).await.map_err(bootstrap_error)?)
+            .map_err(bootstrap_error)?;
+        match commit {
+            BootstrapCommand::Commit { version, nonce }
+                if version == BOOTSTRAP_VERSION && nonce == self.nonce => {}
+            _ => return Err(bootstrap_error("invalid or mismatched managed commit")),
+        }
+
+        let state = Arc::new(AtomicU8::new(STATE_READY));
+        identity.state = STATE_READY;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let control_state = state.clone();
+        let control_task = tokio::spawn(async move {
+            managed_control_loop(&mut listener, identity, control_state, shutdown_tx).await
+        });
+        enum Completion {
+            Exited(std::process::ExitStatus),
+            Shutdown,
+        }
+        let completion = tokio::select! {
+            result = managed.child.wait() => Completion::Exited(result.map_err(bootstrap_error)?),
+            _ = wait_shutdown(&mut shutdown_rx) => Completion::Shutdown,
+        };
+        match completion {
+            Completion::Exited(status) => {
+                if child.tree_policy == ProcessTreePolicy::OwnedTree {
+                    // The wrapper may exit while descendants still retain output
+                    // pipes. Ownership outlives the direct child handle.
+                    force_managed(&mut managed, child.tree_policy).await?;
+                }
+                control_task.abort();
+                managed.finish_output().await;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(bootstrap_error(format!(
+                        "managed child exited with {status}"
+                    )))
+                }
+            }
+            Completion::Shutdown => {
+                state.store(STATE_STOPPING, Ordering::SeqCst);
+                terminate_managed(&mut managed, &child.shutdown, child.tree_policy).await?;
+                control_task.abort();
+                managed.finish_output().await;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -359,6 +477,428 @@ impl AsyncWrite for TrackedStream {
     }
 }
 
+struct ManagedRuntime {
+    child: Child,
+    #[cfg(unix)]
+    process_id: u32,
+    stdout_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    stderr_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl ManagedRuntime {
+    async fn finish_output(&mut self) {
+        // A descendant can accidentally inherit a pipe and keep it open after the
+        // managed process exits. Output EOF is therefore bounded independently
+        // from process termination.
+        for task in [&mut self.stdout_task, &mut self.stderr_task] {
+            if let Some(mut task) = task.take() {
+                if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                }
+            }
+        }
+    }
+}
+
+async fn start_managed(
+    config: &mut ManagedChild,
+    launch: &bootstrap::LaunchConfig,
+) -> Result<(ManagedRuntime, ReadinessResult), Error> {
+    let mut command = config.spawn.command();
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(0x0000_0200 | 0x0800_0000); // NEW_PROCESS_GROUP | NO_WINDOW
+
+    let mut process = command.spawn().map_err(bootstrap_error)?;
+    #[cfg(unix)]
+    let process_id = process
+        .id()
+        .ok_or_else(|| bootstrap_error("managed child has no process id"))?;
+    #[cfg(windows)]
+    let job = WindowsJob::assign(&process).map_err(bootstrap_error)?;
+
+    let stdout = process
+        .stdout
+        .take()
+        .ok_or_else(|| bootstrap_error("managed stdout pipe was not created"))?;
+    let stderr = process
+        .stderr
+        .take()
+        .ok_or_else(|| bootstrap_error("managed stderr pipe was not created"))?;
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel(64);
+    let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel(64);
+    let stdout_task = tokio::spawn(capture_output(
+        stdout,
+        launch.generation_directory.join("managed-stdout.log"),
+        stdout_tx,
+    ));
+    let stderr_task = tokio::spawn(capture_output(
+        stderr,
+        launch.generation_directory.join("managed-stderr.log"),
+        stderr_tx,
+    ));
+    let readiness = std::mem::replace(&mut config.readiness, Readiness::Immediate);
+    let result = wait_for_readiness(
+        readiness,
+        &mut process,
+        OutputEvents {
+            receiver: stdout_rx,
+        },
+        OutputEvents {
+            receiver: stderr_rx,
+        },
+    )
+    .await;
+    if let Err(error) = result {
+        let mut runtime = ManagedRuntime {
+            child: process,
+            #[cfg(unix)]
+            process_id,
+            stdout_task: Some(stdout_task),
+            stderr_task: Some(stderr_task),
+            #[cfg(windows)]
+            job,
+        };
+        let _ = force_managed(&mut runtime, config.tree_policy).await;
+        runtime.finish_output().await;
+        return Err(error);
+    }
+    Ok((
+        ManagedRuntime {
+            child: process,
+            #[cfg(unix)]
+            process_id,
+            stdout_task: Some(stdout_task),
+            stderr_task: Some(stderr_task),
+            #[cfg(windows)]
+            job,
+        },
+        result.expect("readiness result checked above"),
+    ))
+}
+
+async fn capture_output<R>(
+    mut input: R,
+    path: PathBuf,
+    events: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut buffer = vec![0; 16 * 1024];
+    loop {
+        let read = input.read(&mut buffer).await?;
+        if read == 0 {
+            output.flush()?;
+            return Ok(());
+        }
+        output.write_all(&buffer[..read])?;
+        // Logging is authoritative. A slow readiness observer merely misses old
+        // events rather than exerting backpressure on a child's output pipes.
+        let _ = events.try_send(buffer[..read].to_vec());
+    }
+}
+
+async fn wait_for_readiness(
+    readiness: Readiness,
+    process: &mut Child,
+    stdout: OutputEvents,
+    stderr: OutputEvents,
+) -> Result<ReadinessResult, Error> {
+    let started = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    match readiness {
+        Readiness::Immediate => {
+            reject_early_exit(process)?;
+            Ok(ReadinessResult::ready())
+        }
+        Readiness::TcpConnect(endpoint) => {
+            let probe = async {
+                loop {
+                    reject_early_exit(process)?;
+                    match tokio::net::TcpStream::connect(endpoint).await {
+                        Ok(stream) => {
+                            drop(stream);
+                            return Ok(ReadinessResult::ready().service_endpoint(endpoint));
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    }
+                }
+            };
+            tokio::time::timeout(timeout, probe).await.map_err(|_| {
+                bootstrap_error(format!("managed readiness timed out after {timeout:?}"))
+            })?
+        }
+        Readiness::Custom(probe) => {
+            let (exit_tx, exit_rx) = tokio::sync::watch::channel(None);
+            let monitor = async {
+                loop {
+                    if let Some(status) = process.try_wait().map_err(bootstrap_error)? {
+                        let exit = ProcessExit {
+                            code: status.code(),
+                        };
+                        let _ = exit_tx.send(Some(exit));
+                        return Err(bootstrap_error(format!(
+                            "managed child exited before readiness with {status}"
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let context = ReadinessContext {
+                stdout,
+                stderr,
+                elapsed: started.elapsed(),
+                exit: exit_rx,
+            };
+            let custom = async { probe(context).await.map_err(bootstrap_error) };
+            tokio::time::timeout(timeout, async {
+                tokio::select! {
+                    result = custom => result,
+                    result = monitor => result,
+                }
+            })
+            .await
+            .map_err(|_| {
+                bootstrap_error(format!("managed readiness timed out after {timeout:?}"))
+            })?
+        }
+    }
+}
+
+fn reject_early_exit(process: &mut Child) -> Result<(), Error> {
+    match process.try_wait().map_err(bootstrap_error)? {
+        Some(status) => Err(bootstrap_error(format!(
+            "managed child exited before readiness with {status}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn select_managed_endpoint(
+    publication: &EndpointPublication,
+    readiness: ReadinessResult,
+) -> Result<Option<PublishedEndpoint>, Error> {
+    match publication {
+        EndpointPublication::None => Ok(None),
+        EndpointPublication::Fixed(endpoint) => Ok(Some(endpoint.clone())),
+        EndpointPublication::FromReadiness => {
+            readiness.service_endpoint.map(Some).ok_or_else(|| {
+                bootstrap_error(
+                    "endpoint publication requested a readiness endpoint, but none was returned",
+                )
+            })
+        }
+    }
+}
+
+fn service_endpoint_record(endpoint: &PublishedEndpoint) -> crate::record::ServiceEndpointRecord {
+    match endpoint {
+        PublishedEndpoint::Tcp(value) => crate::record::ServiceEndpointRecord::Tcp(*value),
+        PublishedEndpoint::Path(value) => crate::record::ServiceEndpointRecord::Path(value.clone()),
+        PublishedEndpoint::Opaque(value) => {
+            crate::record::ServiceEndpointRecord::Opaque(value.clone())
+        }
+    }
+}
+
+async fn managed_control_loop(
+    listener: &mut NativeListener,
+    identity: crate::protocol::ServerIdentity,
+    state: Arc<AtomicU8>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+) -> Result<(), Error> {
+    loop {
+        let mut stream = listener.accept().await.map_err(bootstrap_error)?;
+        let mut current_identity = identity.clone();
+        current_identity.state = state.load(Ordering::SeqCst);
+        let (_, role) =
+            match server_handshake(&mut stream, &current_identity, Duration::from_secs(10)).await {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
+        if role != ConnectionRole::Control {
+            continue;
+        }
+        let connection_state = state.clone();
+        let connection_shutdown = shutdown.clone();
+        let capabilities = identity.capabilities;
+        tokio::spawn(async move {
+            while let Ok(request) = read_control_request(&mut stream).await {
+                let current = connection_state.load(Ordering::SeqCst);
+                let mut session =
+                    ControlSession::new(ConnectionRole::Control, current, capabilities);
+                let response = match session.handle(&request, &[]) {
+                    Ok(response) => response,
+                    Err(_) => break,
+                };
+                match (&request, &response) {
+                    (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
+                        connection_state.store(STATE_QUIESCING, Ordering::SeqCst);
+                    }
+                    (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
+                        connection_state.store(STATE_STOPPING, Ordering::SeqCst);
+                        let _ = connection_shutdown.send(true);
+                    }
+                    _ => {}
+                }
+                if write_control_response(&mut stream, &response)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+async fn wait_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+}
+
+async fn terminate_managed(
+    runtime: &mut ManagedRuntime,
+    strategy: &ShutdownStrategy,
+    policy: ProcessTreePolicy,
+) -> Result<(), Error> {
+    if runtime.child.try_wait().map_err(bootstrap_error)?.is_some() {
+        return Ok(());
+    }
+    request_graceful(runtime, policy)?;
+    if tokio::time::timeout(strategy.graceful_timeout, runtime.child.wait())
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    force_managed(runtime, policy).await?;
+    tokio::time::timeout(strategy.terminate_timeout, runtime.child.wait())
+        .await
+        .map_err(|_| bootstrap_error("managed process tree did not exit after forced termination"))?
+        .map_err(bootstrap_error)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn request_graceful(runtime: &mut ManagedRuntime, policy: ProcessTreePolicy) -> Result<(), Error> {
+    let target = match policy {
+        ProcessTreePolicy::OwnedTree => -(runtime.process_id as i32),
+        ProcessTreePolicy::DirectChildOnly => runtime.process_id as i32,
+    };
+    let result = unsafe { libc::kill(target, libc::SIGTERM) };
+    if result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(bootstrap_error(io::Error::last_os_error()))
+    }
+}
+
+#[cfg(windows)]
+fn request_graceful(
+    _runtime: &mut ManagedRuntime,
+    _policy: ProcessTreePolicy,
+) -> Result<(), Error> {
+    // There is no protocol-independent graceful signal for arbitrary Windows
+    // processes. The grace interval permits an application-requested exit; the
+    // Job Object is the authoritative escalation mechanism.
+    Ok(())
+}
+
+async fn force_managed(
+    runtime: &mut ManagedRuntime,
+    policy: ProcessTreePolicy,
+) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        let target = match policy {
+            ProcessTreePolicy::OwnedTree => -(runtime.process_id as i32),
+            ProcessTreePolicy::DirectChildOnly => runtime.process_id as i32,
+        };
+        let result = unsafe { libc::kill(target, libc::SIGKILL) };
+        if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(bootstrap_error(io::Error::last_os_error()));
+        }
+    }
+    #[cfg(windows)]
+    match policy {
+        ProcessTreePolicy::OwnedTree => runtime.job.terminate().map_err(bootstrap_error)?,
+        ProcessTreePolicy::DirectChildOnly => {
+            runtime.child.start_kill().map_err(bootstrap_error)?
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn assign(child: &Child) -> io::Result<Self> {
+        use std::mem::size_of;
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        let child_handle = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "child handle is closed"))?;
+        if configured == 0 || unsafe { AssignProcessToJobObject(handle, child_handle as _) } == 0 {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+        Ok(Self(handle))
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
 fn bootstrap_error(error: impl std::fmt::Display) -> Error {
     Error::Bootstrap {
         message: error.to_string(),
@@ -512,6 +1052,7 @@ pub struct ReadinessContext {
     stdout: OutputEvents,
     stderr: OutputEvents,
     elapsed: Duration,
+    exit: tokio::sync::watch::Receiver<Option<ProcessExit>>,
 }
 impl ReadinessContext {
     pub fn stdout(&mut self) -> &mut OutputEvents {
@@ -521,7 +1062,14 @@ impl ReadinessContext {
         &mut self.stderr
     }
     pub async fn exited(&mut self) -> ProcessExit {
-        ProcessExit { code: None }
+        loop {
+            if let Some(exit) = *self.exit.borrow() {
+                return exit;
+            }
+            if self.exit.changed().await.is_err() {
+                return ProcessExit { code: None };
+            }
+        }
     }
     pub fn elapsed(&self) -> Duration {
         self.elapsed
@@ -579,6 +1127,14 @@ impl ShutdownStrategy {
         Self {
             graceful_timeout: Duration::from_secs(10),
             terminate_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Configures the application grace interval and the final kill wait.
+    pub fn with_timeouts(graceful_timeout: Duration, terminate_timeout: Duration) -> Self {
+        Self {
+            graceful_timeout,
+            terminate_timeout,
         }
     }
 }

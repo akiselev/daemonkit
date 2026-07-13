@@ -25,6 +25,7 @@ pub(crate) struct LaunchConfig {
     pub(crate) endpoint: NativeEndpoint,
     pub(crate) lease_path: std::path::PathBuf,
     pub(crate) idle_timeout_millis: Option<u64>,
+    pub(crate) generation_directory: std::path::PathBuf,
 }
 
 impl LaunchConfig {
@@ -49,6 +50,7 @@ impl LaunchConfig {
                 .union(Capabilities::SHUTDOWN)
                 .union(Capabilities::DIAGNOSTICS)
                 .union(Capabilities::APPLICATION_STREAM),
+            service_endpoint: None,
         }
     }
 }
