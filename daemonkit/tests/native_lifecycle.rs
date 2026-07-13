@@ -127,7 +127,7 @@ fn managed_program_fixture() {
             .spawn()
             .unwrap()
     });
-    let noise = vec![b'x'; 256 * 1024];
+    let noise = vec![b'x'; 2 * 1024 * 1024];
     std::io::stdout().write_all(&noise).unwrap();
     std::io::stderr().write_all(&noise).unwrap();
     println!("\nREADY {endpoint}");
@@ -295,8 +295,8 @@ async fn managed_supervisor_publishes_readiness_drains_output_and_kills_tree() {
     let descendant = wait_for_pid(&grandchild_pid).await;
     let stdout_log = find_file(root.as_path(), "managed-stdout.log").unwrap();
     let stderr_log = find_file(root.as_path(), "managed-stderr.log").unwrap();
-    assert!(std::fs::metadata(stdout_log).unwrap().len() >= 256 * 1024);
-    assert!(std::fs::metadata(stderr_log).unwrap().len() >= 256 * 1024);
+    assert!(std::fs::metadata(stdout_log).unwrap().len() >= 2 * 1024 * 1024);
+    assert!(std::fs::metadata(stderr_log).unwrap().len() >= 2 * 1024 * 1024);
 
     daemon.stop().await.unwrap();
     wait_until_process_gone(descendant).await;

@@ -15,9 +15,10 @@ use futures_core::Stream;
 use std::io::Write as _;
 use std::sync::{
     atomic::{AtomicU8, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::{
+    collections::VecDeque,
     error::Error as StdError,
     ffi::OsString,
     fs::OpenOptions,
@@ -26,7 +27,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -548,38 +549,28 @@ async fn start_managed(
         ProcessTreePolicy::DirectChildOnly => None,
     };
 
-    let stdout = process
+    let stdout_pipe = process
         .stdout
         .take()
         .ok_or_else(|| bootstrap_error("managed stdout pipe was not created"))?;
-    let stderr = process
+    let stderr_pipe = process
         .stderr
         .take()
         .ok_or_else(|| bootstrap_error("managed stderr pipe was not created"))?;
-    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel(64);
-    let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel(64);
+    let (stdout_tx, stdout) = output_events(config.logs.tail_bytes);
+    let (stderr_tx, stderr) = output_events(config.logs.tail_bytes);
     let stdout_task = tokio::spawn(capture_output(
-        stdout,
+        stdout_pipe,
         launch.generation_directory.join("managed-stdout.log"),
         stdout_tx,
     ));
     let stderr_task = tokio::spawn(capture_output(
-        stderr,
+        stderr_pipe,
         launch.generation_directory.join("managed-stderr.log"),
         stderr_tx,
     ));
     let readiness = std::mem::replace(&mut config.readiness, Readiness::Immediate);
-    let result = wait_for_readiness(
-        readiness,
-        &mut process,
-        OutputEvents {
-            receiver: stdout_rx,
-        },
-        OutputEvents {
-            receiver: stderr_rx,
-        },
-    )
-    .await;
+    let result = wait_for_readiness(readiness, &mut process, stdout, stderr).await;
     if let Err(error) = result {
         let mut runtime = ManagedRuntime {
             child: process,
@@ -613,11 +604,7 @@ async fn start_managed(
     ))
 }
 
-async fn capture_output<R>(
-    mut input: R,
-    path: PathBuf,
-    events: tokio::sync::mpsc::Sender<Vec<u8>>,
-) -> io::Result<()>
+async fn capture_output<R>(mut input: R, path: PathBuf, events: OutputSink) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -630,9 +617,9 @@ where
             return Ok(());
         }
         output.write_all(&buffer[..read])?;
-        // Logging is authoritative. A slow readiness observer merely misses old
+        // Logging is authoritative. A slow readiness observer sheds the oldest
         // events rather than exerting backpressure on a child's output pipes.
-        let _ = events.try_send(buffer[..read].to_vec());
+        events.send(buffer[..read].to_vec());
     }
 }
 
@@ -1220,12 +1207,97 @@ impl ReadinessContext {
 }
 
 pub struct OutputEvents {
-    receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    shared: Arc<Mutex<OutputEventState>>,
 }
 impl Stream for OutputEvents {
     type Item = Vec<u8>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(event) = state.events.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        if state.closed {
+            return Poll::Ready(None);
+        }
+        if state
+            .waker
+            .as_ref()
+            .map_or(true, |current| !current.will_wake(cx.waker()))
+        {
+            state.waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+struct OutputSink {
+    shared: Arc<Mutex<OutputEventState>>,
+}
+
+struct OutputEventState {
+    events: VecDeque<Vec<u8>>,
+    retained_bytes: usize,
+    capacity_bytes: usize,
+    closed: bool,
+    waker: Option<Waker>,
+}
+
+fn output_events(capacity_bytes: usize) -> (OutputSink, OutputEvents) {
+    let shared = Arc::new(Mutex::new(OutputEventState {
+        events: VecDeque::new(),
+        retained_bytes: 0,
+        capacity_bytes: capacity_bytes.max(1),
+        closed: false,
+        waker: None,
+    }));
+    (
+        OutputSink {
+            shared: shared.clone(),
+        },
+        OutputEvents { shared },
+    )
+}
+
+impl OutputSink {
+    fn send(&self, event: Vec<u8>) {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !state.events.is_empty()
+            && state.retained_bytes.saturating_add(event.len()) > state.capacity_bytes
+        {
+            if let Some(discarded) = state.events.pop_front() {
+                state.retained_bytes = state.retained_bytes.saturating_sub(discarded.len());
+            }
+        }
+        let retained = if event.len() > state.capacity_bytes {
+            let offset = event.len() - state.capacity_bytes;
+            event[offset..].to_vec()
+        } else {
+            event
+        };
+        state.retained_bytes = state.retained_bytes.saturating_add(retained.len());
+        state.events.push_back(retained);
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for OutputSink {
+    fn drop(&mut self) {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -1308,5 +1380,28 @@ impl From<SocketAddr> for PublishedEndpoint {
 impl From<PathBuf> for PublishedEndpoint {
     fn from(value: PathBuf) -> Self {
         Self::Path(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn output_events_retain_newest_bytes_without_backpressure() {
+        let (sink, mut events) = output_events(4);
+        sink.send(b"old".to_vec());
+        sink.send(b"new!".to_vec());
+        drop(sink);
+
+        let newest = std::future::poll_fn(|context| Pin::new(&mut events).poll_next(context))
+            .await
+            .unwrap();
+        assert_eq!(newest, b"new!");
+        assert!(
+            std::future::poll_fn(|context| Pin::new(&mut events).poll_next(context))
+                .await
+                .is_none()
+        );
     }
 }
