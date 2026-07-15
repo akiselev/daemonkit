@@ -273,7 +273,7 @@ where
         write_frame(stream, &[WIRE_REJECT]).await?;
         return Err(ProtocolError::Authentication);
     }
-    if hello.role == ConnectionRole::Application && identity.state == STATE_QUIESCING {
+    if hello.role == ConnectionRole::Application && identity.state >= STATE_QUIESCING {
         write_frame(stream, &[WIRE_BUSY_QUIESCING]).await?;
         return Err(ProtocolError::BusyQuiescing);
     }

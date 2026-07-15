@@ -3,7 +3,7 @@ use crate::{
         bootstrap::{
             self, BootstrapCommand, BOOTSTRAP_MARKER_ENV, BOOTSTRAP_NONCE_ENV, BOOTSTRAP_VERSION,
         },
-        transport::NativeListener,
+        transport::{NativeListener, NativeStream},
     },
     protocol::{
         read_control_request, read_frame, server_handshake, write_control_response, ConnectionRole,
@@ -275,6 +275,10 @@ impl Bootstrap {
         let accept_active = active_streams.clone();
         let accept_identity = launch.server_identity(STATE_READY);
         let accept_shutdown = shutdown_tx.clone();
+        let drain_timeout = launch
+            .drain_timeout_millis
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(10));
         let accept_task = tokio::spawn(async move {
             accept_loop(
                 &mut listener,
@@ -284,6 +288,7 @@ impl Bootstrap {
                 accept_shutdown,
                 accept_active,
                 activity_tx,
+                drain_timeout,
             )
             .await
         });
@@ -321,6 +326,7 @@ const STATE_READY: u8 = 3;
 const STATE_QUIESCING: u8 = 4;
 const STATE_STOPPING: u8 = 5;
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: &mut NativeListener,
     identity: crate::protocol::ServerIdentity,
@@ -329,79 +335,137 @@ async fn accept_loop(
     shutdown: tokio::sync::watch::Sender<bool>,
     active_streams: Arc<AtomicUsize>,
     activity: tokio::sync::watch::Sender<tokio::time::Instant>,
+    drain_timeout: Duration,
 ) -> Result<(), Error> {
+    let mut consecutive_failures: u32 = 0;
     loop {
-        let mut stream = listener.accept().await.map_err(bootstrap_error)?;
-        let mut connection_identity = identity.clone();
-        connection_identity.state = state.load(Ordering::SeqCst);
-        let (_, role) = match server_handshake(
-            &mut stream,
-            &connection_identity,
-            Duration::from_secs(10),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => continue,
-        };
-        match role {
-            ConnectionRole::Application if state.load(Ordering::SeqCst) == STATE_READY => {
-                active_streams.fetch_add(1, Ordering::SeqCst);
-                let _ = activity.send(tokio::time::Instant::now());
-                if state.load(Ordering::SeqCst) != STATE_READY {
-                    active_streams.fetch_sub(1, Ordering::SeqCst);
-                    let _ = activity.send(tokio::time::Instant::now());
-                    continue;
+        // A transient accept failure (EMFILE under load, a peer aborting
+        // mid-accept) must not kill the loop: that would leave a zombie
+        // daemon holding the lease with its socket gone. A persistent
+        // cascade instead requests shutdown so the process exits and a
+        // fresh generation can start.
+        let stream = match listener.accept().await {
+            Ok(stream) => {
+                consecutive_failures = 0;
+                stream
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= 32 {
+                    let _ = shutdown.send(true);
+                    return Err(bootstrap_error(format!(
+                        "accept failed {consecutive_failures} times consecutively: {error}"
+                    )));
                 }
-                let tracked = TrackedStream {
-                    inner: stream,
-                    active_streams: active_streams.clone(),
-                    activity: activity.clone(),
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // Handshakes run per-connection: one peer that connects and never
+        // sends its hello must not head-of-line-block every other client
+        // for the whole handshake deadline.
+        let connection = ConnectionContext {
+            identity: identity.clone(),
+            state: state.clone(),
+            incoming: incoming.clone(),
+            shutdown: shutdown.clone(),
+            active_streams: active_streams.clone(),
+            activity: activity.clone(),
+            drain_timeout,
+        };
+        tokio::spawn(handle_accepted(stream, connection));
+    }
+}
+
+struct ConnectionContext {
+    identity: crate::protocol::ServerIdentity,
+    state: Arc<AtomicU8>,
+    incoming: tokio::sync::mpsc::Sender<Result<AuthenticatedStream, AcceptError>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    active_streams: Arc<AtomicUsize>,
+    activity: tokio::sync::watch::Sender<tokio::time::Instant>,
+    drain_timeout: Duration,
+}
+
+async fn handle_accepted(mut stream: NativeStream, connection: ConnectionContext) {
+    let mut connection_identity = connection.identity;
+    connection_identity.state = connection.state.load(Ordering::SeqCst);
+    let (_, role) =
+        match server_handshake(&mut stream, &connection_identity, Duration::from_secs(10)).await {
+            Ok(result) => result,
+            Err(_) => return,
+        };
+    match role {
+        ConnectionRole::Application if connection.state.load(Ordering::SeqCst) == STATE_READY => {
+            connection.active_streams.fetch_add(1, Ordering::SeqCst);
+            let _ = connection.activity.send(tokio::time::Instant::now());
+            if connection.state.load(Ordering::SeqCst) != STATE_READY {
+                connection.active_streams.fetch_sub(1, Ordering::SeqCst);
+                let _ = connection.activity.send(tokio::time::Instant::now());
+                return;
+            }
+            let tracked = TrackedStream {
+                inner: stream,
+                active_streams: connection.active_streams.clone(),
+                activity: connection.activity.clone(),
+            };
+            let _ = connection
+                .incoming
+                .send(Ok(AuthenticatedStream::from_stream(tracked)))
+                .await;
+        }
+        ConnectionRole::Application => {}
+        ConnectionRole::Control => {
+            let connection_state = connection.state.clone();
+            let connection_shutdown = connection.shutdown.clone();
+            let connection_active = connection.active_streams.clone();
+            let capabilities = connection_identity.capabilities;
+            let drain_timeout = connection.drain_timeout;
+            while let Ok(request) = read_control_request(&mut stream).await {
+                let current = connection_state.load(Ordering::SeqCst);
+                let mut session =
+                    ControlSession::new(ConnectionRole::Control, current, capabilities);
+                let response = match session.handle(&request, &[]) {
+                    Ok(response) => response,
+                    Err(_) => break,
                 };
-                if incoming
-                    .send(Ok(AuthenticatedStream::from_stream(tracked)))
+                match (&request, &response) {
+                    (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
+                        // Bounded drain: waiting forever on one long-lived
+                        // application stream would withhold the response,
+                        // stall this control loop (the follow-up Shutdown
+                        // would never be read), and wedge the instance in
+                        // QUIESCING. On expiry the instance returns to
+                        // READY: an abandoned drain must not poison the
+                        // generation for every future client.
+                        connection_state.store(STATE_QUIESCING, Ordering::SeqCst);
+                        let deadline = tokio::time::Instant::now() + drain_timeout;
+                        while connection_active.load(Ordering::SeqCst) != 0
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        if connection_active.load(Ordering::SeqCst) != 0 {
+                            let _ = connection_state.compare_exchange(
+                                STATE_QUIESCING,
+                                STATE_READY,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            );
+                        }
+                    }
+                    (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
+                        connection_state.store(STATE_STOPPING, Ordering::SeqCst);
+                        let _ = connection_shutdown.send(true);
+                    }
+                    _ => {}
+                }
+                if write_control_response(&mut stream, &response)
                     .await
                     .is_err()
                 {
-                    return Ok(());
+                    break;
                 }
-            }
-            ConnectionRole::Application => {}
-            ConnectionRole::Control => {
-                let connection_state = state.clone();
-                let connection_shutdown = shutdown.clone();
-                let connection_active = active_streams.clone();
-                let capabilities = identity.capabilities;
-                tokio::spawn(async move {
-                    while let Ok(request) = read_control_request(&mut stream).await {
-                        let current = connection_state.load(Ordering::SeqCst);
-                        let mut session =
-                            ControlSession::new(ConnectionRole::Control, current, capabilities);
-                        let response = match session.handle(&request, &[]) {
-                            Ok(response) => response,
-                            Err(_) => break,
-                        };
-                        match (&request, &response) {
-                            (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
-                                connection_state.store(STATE_QUIESCING, Ordering::SeqCst);
-                                while connection_active.load(Ordering::SeqCst) != 0 {
-                                    tokio::time::sleep(Duration::from_millis(5)).await;
-                                }
-                            }
-                            (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
-                                connection_state.store(STATE_STOPPING, Ordering::SeqCst);
-                                let _ = connection_shutdown.send(true);
-                            }
-                            _ => {}
-                        }
-                        if write_control_response(&mut stream, &response)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
             }
         }
     }

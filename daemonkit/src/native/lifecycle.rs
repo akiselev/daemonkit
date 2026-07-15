@@ -34,6 +34,7 @@ pub(crate) struct NativeController {
     isolation: [u8; 32],
     startup_timeout: Duration,
     shutdown_timeout: Duration,
+    drain_timeout: Duration,
     idle_timeout: Option<Duration>,
     compatibility: Compatibility,
     logs: LogPolicy,
@@ -54,6 +55,7 @@ impl NativeController {
                 }),
             startup_timeout: spec.startup_timeout,
             shutdown_timeout: spec.shutdown_timeout,
+            drain_timeout: spec.drain_timeout,
             idle_timeout: spec.idle_timeout,
             compatibility: spec.compatibility.clone(),
             logs: spec.logs.clone(),
@@ -164,6 +166,12 @@ impl NativeController {
             idle_timeout_millis: self
                 .idle_timeout
                 .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
+            drain_timeout_millis: Some(
+                self.drain_timeout
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
             generation_directory: generation_layout.path().to_owned(),
         };
         write_bootstrap(&mut stdin, &BootstrapCommand::Launch(Box::new(launch)))
@@ -458,6 +466,13 @@ impl NativeController {
             .await
             .map_err(|error| match error {
                 crate::protocol::ProtocolError::BusyQuiescing => Error::BusyQuiescing,
+                // The daemon dying mid-handshake or missing its deadline is
+                // an availability problem; reporting it as a credential
+                // failure sends consumers down the wrong path.
+                crate::protocol::ProtocolError::Io(_)
+                | crate::protocol::ProtocolError::Deadline => Error::Unavailable {
+                    generation: Some(record.generation),
+                },
                 _ => Error::AuthenticationFailed,
             })?;
         if negotiated.process_identity != record.process_identity.clone().unwrap_or_default()
