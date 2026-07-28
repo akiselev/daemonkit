@@ -445,14 +445,23 @@ async fn handle_accepted(mut stream: NativeStream, connection: ConnectionContext
                         {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
-                        if connection_active.load(Ordering::SeqCst) != 0 {
-                            let _ = connection_state.compare_exchange(
-                                STATE_QUIESCING,
-                                STATE_READY,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            );
-                        }
+                        // Always return to READY once the drain wait ends. The
+                        // authoritative stop is the follow-up Shutdown, which
+                        // this same loop reads next and which CASes to STOPPING.
+                        // Reverting only when streams remained (the old guard)
+                        // left QUIESCING latched whenever a drain arrived at
+                        // zero active streams and no Shutdown followed (e.g. the
+                        // controller died between Drain and Shutdown): every
+                        // future Application handshake then got BusyQuiescing
+                        // forever while ensure() kept re-attaching via the
+                        // ungated Control role. A concurrent Shutdown that
+                        // already moved us to STOPPING makes this CAS a no-op.
+                        let _ = connection_state.compare_exchange(
+                            STATE_QUIESCING,
+                            STATE_READY,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
                     }
                     (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
                         connection_state.store(STATE_STOPPING, Ordering::SeqCst);
@@ -492,6 +501,19 @@ async fn idle_monitor(
                 {
                     let _ = shutdown.send(true);
                     return;
+                }
+                // The deadline fired but we could not shut down: a stream is
+                // still active, or the state already left READY. Re-arming the
+                // already-elapsed deadline would busy-spin a core (sleep_until
+                // on a past instant resolves immediately, forever). Wait for
+                // the next activity update instead — a stream drop always sends
+                // one, re-arming a fresh deadline. Cap the wait at `timeout` so
+                // a state transition back to READY (which does not ping
+                // activity) is still re-evaluated within one idle period.
+                match tokio::time::timeout(timeout, activity.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(_) => {}
                 }
             }
             changed = activity.changed() => {
@@ -634,7 +656,12 @@ async fn start_managed(
         stderr_tx,
     ));
     let readiness = std::mem::replace(&mut config.readiness, Readiness::Immediate);
-    let result = wait_for_readiness(readiness, &mut process, stdout, stderr).await;
+    let readiness_timeout = launch
+        .readiness_timeout_millis
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_READINESS_TIMEOUT);
+    let result =
+        wait_for_readiness(readiness, &mut process, stdout, stderr, readiness_timeout).await;
     if let Err(error) = result {
         let mut runtime = ManagedRuntime {
             child: process,
@@ -687,14 +714,18 @@ where
     }
 }
 
+/// Fallback managed-readiness bound when the parent did not send one (older
+/// parent, or the consumer left `DaemonSpec::readiness_timeout` unset).
+const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn wait_for_readiness(
     readiness: Readiness,
     process: &mut Child,
     stdout: OutputEvents,
     stderr: OutputEvents,
+    timeout: Duration,
 ) -> Result<ReadinessResult, Error> {
     let started = tokio::time::Instant::now();
-    let timeout = Duration::from_secs(30);
     match readiness {
         Readiness::Immediate => {
             reject_early_exit(process)?;

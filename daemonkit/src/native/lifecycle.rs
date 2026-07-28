@@ -36,6 +36,7 @@ pub(crate) struct NativeController {
     shutdown_timeout: Duration,
     drain_timeout: Duration,
     idle_timeout: Option<Duration>,
+    readiness_timeout: Option<Duration>,
     compatibility: Compatibility,
     logs: LogPolicy,
     runtime_root: Option<RuntimeRoot>,
@@ -57,6 +58,7 @@ impl NativeController {
             shutdown_timeout: spec.shutdown_timeout,
             drain_timeout: spec.drain_timeout,
             idle_timeout: spec.idle_timeout,
+            readiness_timeout: spec.readiness_timeout,
             compatibility: spec.compatibility.clone(),
             logs: spec.logs.clone(),
             runtime_root: spec.runtime_root.clone(),
@@ -172,6 +174,9 @@ impl NativeController {
                     .try_into()
                     .unwrap_or(u64::MAX),
             ),
+            readiness_timeout_millis: self
+                .readiness_timeout
+                .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
             generation_directory: generation_layout.path().to_owned(),
         };
         write_bootstrap(&mut stdin, &BootstrapCommand::Launch(Box::new(launch)))
@@ -189,8 +194,16 @@ impl NativeController {
             })?;
 
         let hello = self.client_hello(generation, token, ConnectionRole::Control);
+        // A managed child only binds this control endpoint after its readiness
+        // probe finishes, so the parent's connect budget must cover the whole
+        // readiness window plus the handshake. Embedded children bind
+        // immediately (readiness_timeout is None), leaving this at
+        // startup_timeout — the historical behavior.
+        let prepare_budget = self
+            .startup_timeout
+            .saturating_add(self.readiness_timeout.unwrap_or(Duration::ZERO));
         let mut prepared = self
-            .connect_until(&endpoint, self.startup_timeout)
+            .connect_until(&endpoint, prepare_budget)
             .await
             .map_err(|error| {
                 startup_error(

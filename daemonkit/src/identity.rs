@@ -442,6 +442,10 @@ pub struct DaemonSpec<K = GlobalKey> {
     pub(crate) shutdown_timeout: Duration,
     pub(crate) drain_timeout: Duration,
     pub(crate) idle_timeout: Option<Duration>,
+    /// Managed-mode only: bounds the readiness probe (JVM/service coming up).
+    /// `None` uses the runtime's historical 30s default. Embedded readiness is
+    /// immediate, so this has no effect there.
+    pub(crate) readiness_timeout: Option<Duration>,
     pub(crate) compatibility: Compatibility,
     pub(crate) logs: LogPolicy,
     pub(crate) transport: TransportConfig,
@@ -458,6 +462,7 @@ impl DaemonSpec<GlobalKey> {
             shutdown_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(10),
             idle_timeout: None,
+            readiness_timeout: None,
             compatibility: Compatibility::current_binary(),
             logs: LogPolicy::default(),
             transport: TransportConfig::NativeLocal,
@@ -476,6 +481,7 @@ impl<K: DaemonKey> DaemonSpec<K> {
             shutdown_timeout: self.shutdown_timeout,
             drain_timeout: self.drain_timeout,
             idle_timeout: self.idle_timeout,
+            readiness_timeout: self.readiness_timeout,
             compatibility: self.compatibility,
             logs: self.logs,
             transport: self.transport,
@@ -500,6 +506,14 @@ impl<K: DaemonKey> DaemonSpec<K> {
     }
     pub fn idle_timeout(mut self, value: Option<Duration>) -> Self {
         self.idle_timeout = value;
+        self
+    }
+    /// Bounds the managed readiness probe (e.g. a JVM opening a large project
+    /// before it publishes its port). Set this above `startup_timeout` for
+    /// slow-starting managed children; it is ignored in embedded mode. When
+    /// unset, the runtime keeps its historical 30s cap.
+    pub fn readiness_timeout(mut self, value: Duration) -> Self {
+        self.readiness_timeout = Some(value);
         self
     }
     pub fn compatibility(mut self, value: Compatibility) -> Self {

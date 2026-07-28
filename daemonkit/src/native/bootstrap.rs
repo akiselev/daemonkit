@@ -30,6 +30,12 @@ pub(crate) struct LaunchConfig {
     /// the mixed-version case only arises for out-of-tree bootstrap hosts).
     #[serde(default)]
     pub(crate) drain_timeout_millis: Option<u64>,
+    /// Bounds the managed readiness probe. Added after 0.1.0; `default` keeps
+    /// launches from older parents decodable. `None` falls back to the child's
+    /// historical 30s cap. Ignored by embedded children (readiness is
+    /// immediate: they bind the endpoint as soon as the launch is decoded).
+    #[serde(default)]
+    pub(crate) readiness_timeout_millis: Option<u64>,
     pub(crate) generation_directory: std::path::PathBuf,
 }
 
