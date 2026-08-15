@@ -22,5 +22,5 @@ thiserror = "2.0"
 tokio = { version = "1.40", features = ["io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 # Keep the public MSRV honest: newer uuid releases select getrandom 0.4,
 # whose Edition 2024 manifest cannot be parsed by Cargo 1.81.
-uuid = { version = "=1.10.0", features = ["serde", "v4"] }
+uuid = { version = "1.12.0", features = ["serde", "v4"] }
 tempfile = "3.12"
