@@ -359,6 +359,19 @@ mod tests {
             .is_some_and(|name| name.to_string_lossy().starts_with("daemonkit-")));
     }
 
+    /// Directories need backup semantics to be opened as files on Windows.
+    fn open_directory(path: &Path) -> fs::File {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            options
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options.open(path).unwrap()
+    }
+
     #[test]
     fn newest_generation_directory_ignores_foreign_entries() {
         let (_parent, layout) = layout();
@@ -367,8 +380,7 @@ mod tests {
             let generation = layout.create_generation(GenerationId(id)).unwrap();
             fs::write(generation.path().join("daemon.log"), b"x").unwrap();
             let later = SystemTime::now() + std::time::Duration::from_secs(id as u64);
-            fs::File::open(generation.path())
-                .unwrap()
+            open_directory(generation.path())
                 .set_modified(later)
                 .unwrap();
         }
