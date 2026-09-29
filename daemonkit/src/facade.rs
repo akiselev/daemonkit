@@ -148,6 +148,130 @@ impl fmt::Debug for Spawn {
     }
 }
 
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "native-process",
+    feature = "native-transport"
+))]
+impl<M> Daemon<M, DefaultPlatform> {
+    /// Subscribe to the daemon's structured events (logs, child output,
+    /// runtime notices). See [`crate::EventTail`].
+    pub fn events(&self) -> crate::EventTail {
+        crate::EventTail::new(self.controller.native.clone())
+    }
+
+    /// Tail a persistent log file; works without a live daemon.
+    pub fn logs(&self) -> crate::LogTail {
+        crate::LogTail::new(self.controller.native.clone())
+    }
+
+    /// Replace the running daemon's reloadable log filter.
+    pub async fn set_log_filter(&self, directives: &str) -> Result<(), Error> {
+        self.client().set_log_filter(directives).await
+    }
+
+    /// Recent events rendered as text by the daemon.
+    pub async fn diagnostics(&self) -> Result<Vec<u8>, Error> {
+        self.client().diagnostics().await
+    }
+
+    /// Typed live self-report from the running generation.
+    pub async fn inspect(&self) -> Result<crate::InstanceReport, Error> {
+        self.client().inspect().await
+    }
+}
+
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "native-process",
+    feature = "native-transport"
+))]
+impl<M> DaemonClient<M, DefaultPlatform> {
+    /// Subscribe to the daemon's structured events (logs, child output,
+    /// runtime notices). See [`crate::EventTail`].
+    pub fn events(&self) -> crate::EventTail {
+        crate::EventTail::new(self.controller.native.clone())
+    }
+
+    /// Tail a persistent log file; works without a live daemon.
+    pub fn logs(&self) -> crate::LogTail {
+        crate::LogTail::new(self.controller.native.clone())
+    }
+
+    /// Replace the running daemon's reloadable log filter.
+    pub async fn set_log_filter(&self, directives: &str) -> Result<(), Error> {
+        let instance = self
+            .controller
+            .native
+            .attach()
+            .await?
+            .ok_or(Error::Unavailable { generation: None })?;
+        self.controller
+            .native
+            .set_log_filter(&instance.record, directives)
+            .await
+    }
+
+    /// Recent events rendered as text by the daemon.
+    pub async fn diagnostics(&self) -> Result<Vec<u8>, Error> {
+        let instance = self
+            .controller
+            .native
+            .attach()
+            .await?
+            .ok_or(Error::Unavailable { generation: None })?;
+        self.controller.native.diagnostics(&instance.record).await
+    }
+
+    /// Typed live self-report from the running generation.
+    pub async fn inspect(&self) -> Result<crate::InstanceReport, Error> {
+        let instance = self
+            .controller
+            .native
+            .attach()
+            .await?
+            .ok_or(Error::Unavailable { generation: None })?;
+        self.controller.native.inspect(&instance.record).await
+    }
+}
+
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "native-process",
+    feature = "native-transport"
+))]
+impl<M> Instance<M> {
+    /// Subscribe to this generation's structured events.
+    pub fn events(&self) -> crate::EventTail {
+        crate::EventTail::new(self.controller.native.clone())
+    }
+
+    /// Tail one of this instance's persistent log files.
+    pub fn logs(&self) -> crate::LogTail {
+        crate::LogTail::new(self.controller.native.clone())
+    }
+
+    /// Typed self-report; fails with `GenerationChanged` if this generation
+    /// was replaced.
+    pub async fn inspect(&self) -> Result<crate::InstanceReport, Error> {
+        let observed = self
+            .controller
+            .native
+            .attach()
+            .await?
+            .ok_or(Error::Unavailable {
+                generation: Some(self.generation),
+            })?;
+        if observed.record.generation != self.generation {
+            return Err(Error::GenerationChanged {
+                expected: self.generation,
+                observed: Some(observed.record.generation),
+            });
+        }
+        self.controller.native.inspect(&observed.record).await
+    }
+}
+
 #[derive(Clone)]
 struct Controller<P> {
     instance: InstanceId,

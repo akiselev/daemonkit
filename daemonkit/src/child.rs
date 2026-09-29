@@ -1,3 +1,6 @@
+use crate::events::{
+    Event, EventFilter, EventHub, EventPolicy, EventSink, EventSource, Level, LineSplitter,
+};
 use crate::{
     native::{
         bootstrap::{
@@ -6,11 +9,15 @@ use crate::{
         transport::{NativeListener, NativeStream},
     },
     protocol::{
-        read_control_request, read_frame, server_handshake, write_control_response, ConnectionRole,
-        ControlMessage, ControlResponse, ControlSession,
+        read_control_request, read_frame, server_handshake, write_control_response,
+        write_event_frame, ConnectionRole, ControlMessage, ControlResponse, ControlSession,
+        WireEvent,
     },
 };
-use crate::{AuthenticatedStream, Error, PublishedEndpoint, Spawn};
+use crate::{
+    AuthenticatedStream, DaemonMode, EndReason, Error, GenerationId, InstanceReport,
+    LifecycleState, PublishedEndpoint, Spawn,
+};
 use futures_core::Stream;
 use std::io::Write as _;
 use std::sync::{
@@ -36,6 +43,7 @@ use tokio::process::Child;
 /// Validated one-shot inherited bootstrap channel.
 pub struct Bootstrap {
     nonce: String,
+    hub: EventHub,
 }
 
 impl Bootstrap {
@@ -50,7 +58,22 @@ impl Bootstrap {
         if nonce.len() != 64 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BootstrapError::Malformed);
         }
-        Ok(Some(Self { nonce }))
+        Ok(Some(Self {
+            nonce,
+            hub: EventHub::new(EventPolicy::default()),
+        }))
+    }
+
+    /// Publisher for structured events that clients can tail. Clone it into a
+    /// `tracing` layer (see `daemonkit::tracing::layer`) or publish directly.
+    pub fn events(&self) -> EventSink {
+        self.hub.sink()
+    }
+
+    /// Bound the retained event ring and per-subscriber queues.
+    pub fn event_policy(self, policy: EventPolicy) -> Self {
+        self.hub.set_policy(policy);
+        self
     }
 
     pub async fn run_embedded<S>(self, service: S) -> Result<(), Error>
@@ -99,7 +122,11 @@ impl Bootstrap {
             .acquire(Duration::from_secs(10))
             .map_err(bootstrap_error)?;
 
-        let (mut managed, readiness_result) = start_managed(&mut child, &launch).await?;
+        let _ = self
+            .hub
+            .attach_log(&launch.generation_directory.join("daemon.log"));
+        let (mut managed, readiness_result) =
+            start_managed(&mut child, &launch, self.hub.sink()).await?;
         let endpoint = select_managed_endpoint(&child.endpoint, readiness_result)?;
         let encoded_endpoint = endpoint
             .as_ref()
@@ -119,7 +146,9 @@ impl Bootstrap {
         identity.capabilities = crate::protocol::Capabilities::STATUS
             .union(crate::protocol::Capabilities::DRAIN)
             .union(crate::protocol::Capabilities::SHUTDOWN)
-            .union(crate::protocol::Capabilities::DIAGNOSTICS);
+            .union(crate::protocol::Capabilities::DIAGNOSTICS)
+            .union(crate::protocol::Capabilities::EVENTS)
+            .union(crate::protocol::Capabilities::INSPECT);
         identity.service_endpoint = encoded_endpoint;
         let (preparing, role) = {
             let prepared = async {
@@ -162,9 +191,30 @@ impl Bootstrap {
         identity.state = STATE_READY;
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let control_state = state.clone();
-        let control_task = tokio::spawn(async move {
-            managed_control_loop(&mut listener, identity, control_state, shutdown_tx).await
+        let control_hub = self.hub.clone();
+        let report = Arc::new(ReportContext {
+            generation: GenerationId(u128::from_be_bytes(launch.generation)),
+            mode: DaemonMode::Managed,
+            process_id: launch.process_id,
+            managed_process_id: managed.child.id(),
+            started: tokio::time::Instant::now(),
         });
+        let control_task = tokio::spawn(async move {
+            managed_control_loop(
+                &mut listener,
+                identity,
+                control_state,
+                shutdown_tx,
+                control_hub,
+                report,
+            )
+            .await
+        });
+        self.hub.sink().publish(runtime_event(
+            Level::Info,
+            "managed child is ready",
+            Some(("generation", hex_generation(&launch.generation))),
+        ));
         enum Completion {
             Exited(std::process::ExitStatus),
             Shutdown,
@@ -183,6 +233,16 @@ impl Bootstrap {
                 managed.release_tree().await;
                 control_task.abort();
                 managed.finish_output().await;
+                self.hub.sink().publish(runtime_event(
+                    if status.success() {
+                        Level::Info
+                    } else {
+                        Level::Error
+                    },
+                    "managed child exited",
+                    Some(("status", status.to_string())),
+                ));
+                self.hub.close().await;
                 if status.success() {
                     Ok(())
                 } else {
@@ -193,10 +253,16 @@ impl Bootstrap {
             }
             Completion::Shutdown => {
                 state.store(STATE_STOPPING, Ordering::SeqCst);
+                self.hub.sink().publish(runtime_event(
+                    Level::Info,
+                    "shutdown requested; terminating managed child",
+                    None,
+                ));
                 terminate_managed(&mut managed, &child.shutdown, child.tree_policy).await?;
                 managed.release_tree().await;
                 control_task.abort();
                 managed.finish_output().await;
+                self.hub.close().await;
                 Ok(())
             }
         }
@@ -225,6 +291,9 @@ impl Bootstrap {
         let _lease = crate::native::locks::StableLock::new(&launch.lease_path)
             .acquire(Duration::from_secs(10))
             .map_err(bootstrap_error)?;
+        let _ = self
+            .hub
+            .attach_log(&launch.generation_directory.join("daemon.log"));
         let mut listener = NativeListener::bind(&launch.endpoint).map_err(bootstrap_error)?;
         let identity = launch.server_identity(STATE_PUBLISHED);
 
@@ -275,6 +344,14 @@ impl Bootstrap {
         let accept_active = active_streams.clone();
         let accept_identity = launch.server_identity(STATE_READY);
         let accept_shutdown = shutdown_tx.clone();
+        let accept_hub = self.hub.clone();
+        let accept_report = Arc::new(ReportContext {
+            generation: GenerationId(u128::from_be_bytes(launch.generation)),
+            mode: DaemonMode::Embedded,
+            process_id: launch.process_id,
+            managed_process_id: None,
+            started: tokio::time::Instant::now(),
+        });
         let drain_timeout = launch
             .drain_timeout_millis
             .map(Duration::from_millis)
@@ -289,6 +366,8 @@ impl Bootstrap {
                 accept_active,
                 activity_tx,
                 drain_timeout,
+                accept_hub,
+                accept_report,
             )
             .await
         });
@@ -299,11 +378,18 @@ impl Bootstrap {
                 active_streams,
                 activity_rx,
                 shutdown_tx.clone(),
+                self.hub.sink(),
             ))
         });
         let context = ServiceContext {
             generation: crate::GenerationId(u128::from_be_bytes(launch.generation)),
+            events: self.hub.sink(),
         };
+        self.hub.sink().publish(runtime_event(
+            Level::Info,
+            "embedded daemon is ready",
+            Some(("generation", hex_generation(&launch.generation))),
+        ));
         let incoming = Incoming {
             receiver: incoming_rx,
         };
@@ -313,6 +399,19 @@ impl Bootstrap {
         let service_result = service(context, incoming, shutdown).await;
         state.store(STATE_STOPPING, Ordering::SeqCst);
         let _ = shutdown_tx.send(true);
+        match &service_result {
+            Ok(()) => {
+                self.hub
+                    .sink()
+                    .publish(runtime_event(Level::Info, "embedded service exited", None))
+            }
+            Err(error) => self.hub.sink().publish(runtime_event(
+                Level::Error,
+                "embedded service failed",
+                Some(("error", error.clone())),
+            )),
+        }
+        self.hub.close().await;
         accept_task.abort();
         if let Some(task) = idle_task {
             task.abort();
@@ -336,6 +435,8 @@ async fn accept_loop(
     active_streams: Arc<AtomicUsize>,
     activity: tokio::sync::watch::Sender<tokio::time::Instant>,
     drain_timeout: Duration,
+    hub: EventHub,
+    report: Arc<ReportContext>,
 ) -> Result<(), Error> {
     let mut consecutive_failures: u32 = 0;
     loop {
@@ -372,6 +473,8 @@ async fn accept_loop(
             active_streams: active_streams.clone(),
             activity: activity.clone(),
             drain_timeout,
+            hub: hub.clone(),
+            report: report.clone(),
         };
         tokio::spawn(handle_accepted(stream, connection));
     }
@@ -385,6 +488,8 @@ struct ConnectionContext {
     active_streams: Arc<AtomicUsize>,
     activity: tokio::sync::watch::Sender<tokio::time::Instant>,
     drain_timeout: Duration,
+    hub: EventHub,
+    report: Arc<ReportContext>,
 }
 
 async fn handle_accepted(mut stream: NativeStream, connection: ConnectionContext) {
@@ -416,68 +521,264 @@ async fn handle_accepted(mut stream: NativeStream, connection: ConnectionContext
         }
         ConnectionRole::Application => {}
         ConnectionRole::Control => {
-            let connection_state = connection.state.clone();
-            let connection_shutdown = connection.shutdown.clone();
-            let connection_active = connection.active_streams.clone();
-            let capabilities = connection_identity.capabilities;
-            let drain_timeout = connection.drain_timeout;
-            while let Ok(request) = read_control_request(&mut stream).await {
-                let current = connection_state.load(Ordering::SeqCst);
-                let mut session =
-                    ControlSession::new(ConnectionRole::Control, current, capabilities);
-                let response = match session.handle(&request, &[]) {
-                    Ok(response) => response,
-                    Err(_) => break,
-                };
-                match (&request, &response) {
-                    (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
-                        // Bounded drain: waiting forever on one long-lived
-                        // application stream would withhold the response,
-                        // stall this control loop (the follow-up Shutdown
-                        // would never be read), and wedge the instance in
-                        // QUIESCING. On expiry the instance returns to
-                        // READY: an abandoned drain must not poison the
-                        // generation for every future client.
-                        connection_state.store(STATE_QUIESCING, Ordering::SeqCst);
-                        let deadline = tokio::time::Instant::now() + drain_timeout;
-                        while connection_active.load(Ordering::SeqCst) != 0
-                            && tokio::time::Instant::now() < deadline
-                        {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                        // Always return to READY once the drain wait ends. The
-                        // authoritative stop is the follow-up Shutdown, which
-                        // this same loop reads next and which CASes to STOPPING.
-                        // Reverting only when streams remained (the old guard)
-                        // left QUIESCING latched whenever a drain arrived at
-                        // zero active streams and no Shutdown followed (e.g. the
-                        // controller died between Drain and Shutdown): every
-                        // future Application handshake then got BusyQuiescing
-                        // forever while ensure() kept re-attaching via the
-                        // ungated Control role. A concurrent Shutdown that
-                        // already moved us to STOPPING makes this CAS a no-op.
-                        let _ = connection_state.compare_exchange(
-                            STATE_QUIESCING,
-                            STATE_READY,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        );
+            serve_control(
+                stream,
+                ControlServer {
+                    state: connection.state.clone(),
+                    shutdown: connection.shutdown.clone(),
+                    capabilities: connection_identity.capabilities,
+                    hub: connection.hub.clone(),
+                    report: connection.report.clone(),
+                    drain: Some(DrainWait {
+                        active_streams: connection.active_streams.clone(),
+                        timeout: connection.drain_timeout,
+                    }),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+struct ControlServer {
+    state: Arc<AtomicU8>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    capabilities: crate::protocol::Capabilities,
+    hub: EventHub,
+    report: Arc<ReportContext>,
+    /// Embedded daemons wait for application streams to finish on Drain;
+    /// managed supervisors only record the state.
+    drain: Option<DrainWait>,
+}
+
+struct DrainWait {
+    active_streams: Arc<AtomicUsize>,
+    timeout: Duration,
+}
+
+/// Static facts about this generation for `Inspect` reports.
+struct ReportContext {
+    generation: GenerationId,
+    mode: DaemonMode,
+    process_id: u32,
+    managed_process_id: Option<u32>,
+    started: tokio::time::Instant,
+}
+
+impl ControlServer {
+    fn report(&self, state: u8) -> Vec<u8> {
+        let stats = self.hub.stats();
+        let report = InstanceReport {
+            generation: self.report.generation,
+            mode: self.report.mode,
+            state: match state {
+                STATE_PUBLISHED => LifecycleState::Published,
+                STATE_READY => LifecycleState::Ready,
+                STATE_QUIESCING => LifecycleState::Quiescing,
+                STATE_STOPPING => LifecycleState::Stopping,
+                _ => LifecycleState::Unhealthy,
+            },
+            process_id: self.report.process_id,
+            managed_process_id: self.report.managed_process_id,
+            uptime_millis: self.report.started.elapsed().as_millis() as u64,
+            active_streams: self
+                .drain
+                .as_ref()
+                .map_or(0, |drain| drain.active_streams.load(Ordering::SeqCst)),
+            events_published: stats.published,
+            event_subscribers: stats.subscribers,
+            log_filter: stats.directives,
+        };
+        serde_json::to_vec(&report).unwrap_or_default()
+    }
+}
+
+const MAX_DIAGNOSTICS_RENDER_BYTES: usize = 32 * 1024;
+
+async fn serve_control(mut stream: NativeStream, server: ControlServer) {
+    while let Ok(request) = read_control_request(&mut stream).await {
+        let current = server.state.load(Ordering::SeqCst);
+        let mut session =
+            ControlSession::new(ConnectionRole::Control, current, server.capabilities);
+        let payload = match request {
+            ControlMessage::Diagnostics { .. } => {
+                server.hub.render_recent(MAX_DIAGNOSTICS_RENDER_BYTES)
+            }
+            ControlMessage::Inspect { .. } => server.report(current),
+            _ => Vec::new(),
+        };
+        let mut response = match session.handle(&request, &payload) {
+            Ok(response) => response,
+            Err(_) => break,
+        };
+        match (&request, &response) {
+            (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
+                server.state.store(STATE_QUIESCING, Ordering::SeqCst);
+                server
+                    .hub
+                    .sink()
+                    .publish(runtime_event(Level::Info, "drain requested", None));
+                if let Some(drain) = &server.drain {
+                    // Bounded drain: waiting forever on one long-lived
+                    // application stream would withhold the response,
+                    // stall this control loop (the follow-up Shutdown
+                    // would never be read), and wedge the instance in
+                    // QUIESCING. On expiry the instance returns to
+                    // READY: an abandoned drain must not poison the
+                    // generation for every future client.
+                    let deadline = tokio::time::Instant::now() + drain.timeout;
+                    while drain.active_streams.load(Ordering::SeqCst) != 0
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
-                        connection_state.store(STATE_STOPPING, Ordering::SeqCst);
-                        let _ = connection_shutdown.send(true);
-                    }
-                    _ => {}
+                    // Always return to READY once the drain wait ends. The
+                    // authoritative stop is the follow-up Shutdown, which
+                    // this same loop reads next and which CASes to STOPPING.
+                    // Reverting only when streams remained (the old guard)
+                    // left QUIESCING latched whenever a drain arrived at
+                    // zero active streams and no Shutdown followed (e.g. the
+                    // controller died between Drain and Shutdown): every
+                    // future Application handshake then got BusyQuiescing
+                    // forever while ensure() kept re-attaching via the
+                    // ungated Control role. A concurrent Shutdown that
+                    // already moved us to STOPPING makes this CAS a no-op.
+                    let _ = server.state.compare_exchange(
+                        STATE_QUIESCING,
+                        STATE_READY,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
                 }
+            }
+            (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
+                server.state.store(STATE_STOPPING, Ordering::SeqCst);
+                server
+                    .hub
+                    .sink()
+                    .publish(runtime_event(Level::Info, "shutdown requested", None));
+                let _ = server.shutdown.send(true);
+            }
+            (
+                ControlMessage::SetLogFilter {
+                    request_id,
+                    directives,
+                },
+                ControlResponse::Accepted { .. },
+            ) => {
+                if let Err(error) = server.hub.set_filter(directives) {
+                    response = ControlResponse::Rejected {
+                        request_id: *request_id,
+                        reason: error.message().to_owned(),
+                    };
+                } else {
+                    server.hub.sink().publish(runtime_event(
+                        Level::Info,
+                        "log filter changed",
+                        Some(("filter", directives.clone())),
+                    ));
+                }
+            }
+            (
+                ControlMessage::OpenEventStream {
+                    replay,
+                    follow,
+                    filter,
+                    ..
+                },
+                ControlResponse::EventStream { .. },
+            ) => {
                 if write_control_response(&mut stream, &response)
                     .await
                     .is_err()
                 {
                     break;
                 }
+                let filter = EventFilter::parse(filter).unwrap_or_default();
+                stream_events(stream, &server.hub, *replay as usize, *follow, filter).await;
+                return;
             }
+            _ => {}
+        }
+        if write_control_response(&mut stream, &response)
+            .await
+            .is_err()
+        {
+            break;
         }
     }
+}
+
+/// Push replayed then live events until the client hangs up, the replay
+/// completes without follow, or the generation shuts down.
+async fn stream_events(
+    stream: NativeStream,
+    hub: &EventHub,
+    replay: usize,
+    follow: bool,
+    filter: EventFilter,
+) {
+    let _streaming = hub.streaming();
+    let mut subscription = hub.subscribe(replay, &filter);
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    for event in std::mem::take(&mut subscription.replayed) {
+        if write_event_frame(&mut writer, &WireEvent::Event((*event).clone()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    if !follow {
+        let _ = write_event_frame(
+            &mut writer,
+            &WireEvent::End {
+                reason: EndReason::Replayed,
+            },
+        )
+        .await;
+        return;
+    }
+    // Any frame from the client, including EOF, ends the subscription: the
+    // control connection is one-way once it carries events.
+    let mut hangup = Box::pin(async move {
+        let _ = read_frame(&mut reader).await;
+    });
+    loop {
+        let frame = tokio::select! {
+            _ = &mut hangup => return,
+            next = subscription.next_live() => match next {
+                Ok(Some(event)) => WireEvent::Event((*event).clone()),
+                Ok(None) => {
+                    let _ = write_event_frame(
+                        &mut writer,
+                        &WireEvent::End { reason: EndReason::Shutdown },
+                    )
+                    .await;
+                    return;
+                }
+                Err(dropped) => WireEvent::Lagged { dropped },
+            },
+        };
+        if write_event_frame(&mut writer, &frame).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn runtime_event(level: Level, message: &str, field: Option<(&str, String)>) -> Event {
+    let mut event = Event::new(EventSource::Runtime, level, "daemonkit", message);
+    if let Some((key, value)) = field {
+        event = event.field(key, value);
+    }
+    event
+}
+
+fn hex_generation(generation: &[u8; 16]) -> String {
+    generation
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn idle_monitor(
@@ -486,6 +787,7 @@ async fn idle_monitor(
     active_streams: Arc<AtomicUsize>,
     mut activity: tokio::sync::watch::Receiver<tokio::time::Instant>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    events: EventSink,
 ) {
     loop {
         let deadline = *activity.borrow() + timeout;
@@ -499,6 +801,11 @@ async fn idle_monitor(
                         Ordering::SeqCst,
                     ).is_ok()
                 {
+                    events.publish(runtime_event(
+                        Level::Info,
+                        "idle timeout elapsed; shutting down",
+                        None,
+                    ));
                     let _ = shutdown.send(true);
                     return;
                 }
@@ -606,6 +913,7 @@ impl ManagedRuntime {
 async fn start_managed(
     config: &mut ManagedChild,
     launch: &bootstrap::LaunchConfig,
+    events: EventSink,
 ) -> Result<(ManagedRuntime, ReadinessResult), Error> {
     let mut command = config.spawn.command();
     command
@@ -649,11 +957,13 @@ async fn start_managed(
         stdout_pipe,
         launch.generation_directory.join("managed-stdout.log"),
         stdout_tx,
+        LineSplitter::new(events.clone(), EventSource::Stdout),
     ));
     let stderr_task = tokio::spawn(capture_output(
         stderr_pipe,
         launch.generation_directory.join("managed-stderr.log"),
         stderr_tx,
+        LineSplitter::new(events, EventSource::Stderr),
     ));
     let readiness = std::mem::replace(&mut config.readiness, Readiness::Immediate);
     let readiness_timeout = launch
@@ -695,7 +1005,12 @@ async fn start_managed(
     ))
 }
 
-async fn capture_output<R>(mut input: R, path: PathBuf, events: OutputSink) -> io::Result<()>
+async fn capture_output<R>(
+    mut input: R,
+    path: PathBuf,
+    events: OutputSink,
+    mut lines: LineSplitter,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -704,13 +1019,16 @@ where
     loop {
         let read = input.read(&mut buffer).await?;
         if read == 0 {
+            lines.flush();
             output.flush()?;
             return Ok(());
         }
         output.write_all(&buffer[..read])?;
-        // Logging is authoritative. A slow readiness observer sheds the oldest
-        // events rather than exerting backpressure on a child's output pipes.
+        // Logging is authoritative. A slow readiness observer or event
+        // subscriber sheds the oldest events rather than exerting
+        // backpressure on a child's output pipes.
         events.send(buffer[..read].to_vec());
+        lines.push(&buffer[..read]);
     }
 }
 
@@ -826,6 +1144,8 @@ async fn managed_control_loop(
     identity: crate::protocol::ServerIdentity,
     state: Arc<AtomicU8>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    hub: EventHub,
+    report: Arc<ReportContext>,
 ) -> Result<(), Error> {
     loop {
         let mut stream = listener.accept().await.map_err(bootstrap_error)?;
@@ -839,36 +1159,15 @@ async fn managed_control_loop(
         if role != ConnectionRole::Control {
             continue;
         }
-        let connection_state = state.clone();
-        let connection_shutdown = shutdown.clone();
-        let capabilities = identity.capabilities;
-        tokio::spawn(async move {
-            while let Ok(request) = read_control_request(&mut stream).await {
-                let current = connection_state.load(Ordering::SeqCst);
-                let mut session =
-                    ControlSession::new(ConnectionRole::Control, current, capabilities);
-                let response = match session.handle(&request, &[]) {
-                    Ok(response) => response,
-                    Err(_) => break,
-                };
-                match (&request, &response) {
-                    (ControlMessage::Drain { .. }, ControlResponse::Accepted { .. }) => {
-                        connection_state.store(STATE_QUIESCING, Ordering::SeqCst);
-                    }
-                    (ControlMessage::Shutdown { .. }, ControlResponse::Accepted { .. }) => {
-                        connection_state.store(STATE_STOPPING, Ordering::SeqCst);
-                        let _ = connection_shutdown.send(true);
-                    }
-                    _ => {}
-                }
-                if write_control_response(&mut stream, &response)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let server = ControlServer {
+            state: state.clone(),
+            shutdown: shutdown.clone(),
+            capabilities: identity.capabilities,
+            hub: hub.clone(),
+            report: report.clone(),
+            drain: None,
+        };
+        tokio::spawn(serve_control(stream, server));
     }
 }
 
@@ -1154,10 +1453,16 @@ pub trait EmbeddedService: Send + 'static {
 #[derive(Clone, Debug)]
 pub struct ServiceContext {
     generation: crate::GenerationId,
+    events: EventSink,
 }
 impl ServiceContext {
     pub fn generation(&self) -> crate::GenerationId {
         self.generation
+    }
+
+    /// Publisher for events clients can tail; same hub as [`Bootstrap::events`].
+    pub fn events(&self) -> &EventSink {
+        &self.events
     }
 }
 
