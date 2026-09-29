@@ -71,9 +71,14 @@ supervised managed children; the cross-platform CI matrix is active and passing.
 
 ## Next
 
-The event/tail/inspect work is implemented and verified locally but not yet
-committed or pushed; hosted macOS/Windows legs still need a CI run (new
-`tracing-native` matrix row added). Then: Phase 5 hardening, benchmarks, and
-the debugger-cli/ghidra-cli migration spikes, which should exercise
+The event/tail/inspect work is on branch `interactive-events` as PR #3.
+CI run 36579888712 passed all 16 jobs (Ubuntu, macOS, Windows contracts,
+seven feature rows including the new `tracing-native`, MSRV 1.81, stress,
+trybuild, package, audit). Two CI-only fixes landed on the way: the layout
+mtime test opens directories with backup semantics and write-attribute
+access on Windows, and the pre-existing idle-shutdown test now uses a 400 ms
+idle timeout so a loaded runner can connect before it fires. Awaiting review
+and merge. Then: Phase 5 hardening, benchmarks, and the
+debugger-cli/ghidra-cli migration spikes, which should exercise
 `tail --follow`, `status --json` via `inspect`, and `set_log_filter` end to
 end from a real CLI.
