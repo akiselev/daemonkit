@@ -216,7 +216,9 @@ async fn idle_shutdown_waits_for_active_stream_then_ensure_repairs_and_restarts(
         DaemonSpec::new("com.example.idle")
             .unwrap()
             .runtime_root(root)
-            .idle_timeout(Some(Duration::from_millis(100))),
+            // Generous enough that a loaded CI runner can connect before the
+            // idle timer fires; the sleeps below scale with it.
+            .idle_timeout(Some(Duration::from_millis(400))),
         fixture_spawn().env("DAEMONKIT_TEST_HOLD_STREAM", "1"),
     )
     .unwrap();
@@ -226,13 +228,13 @@ async fn idle_shutdown_waits_for_active_stream_then_ensure_repairs_and_restarts(
     stream.write_all(b"echo").await.unwrap();
     let mut echoed = [0; 4];
     stream.read_exact(&mut echoed).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(matches!(
         daemon.status().await.unwrap(),
         InstanceStatus::Ready(_)
     ));
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     let successor = daemon.ensure().await.unwrap();
     assert_ne!(successor.generation(), first_generation);
     daemon.stop().await.unwrap();
