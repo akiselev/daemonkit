@@ -30,11 +30,33 @@ supervised managed children; the cross-platform CI matrix is active and passing.
   large-output readiness, typed endpoint discovery, forced tree cleanup, and
   cleanup after supervisor crash without application PID/port files.
 
+- Interactive events (2026-09-28): every daemon runs an in-process event hub
+  (bounded ring, non-blocking broadcast, `daemon.log` mirror). Clients tail it
+  over the authenticated control channel via `events()` (replay, follow,
+  `tracing`-style filter, reattach across restarts, `Lagged` markers) using
+  new capability-gated `OpenEventStream`/`SetLogFilter` messages; `Diagnostics`
+  now returns rendered recent events. Managed stdout/stderr stream as bounded
+  line events. The `tracing` feature adds a per-layer-filtered forwarding
+  Layer with a runtime-reloadable filter (`set_log_filter`). `logs()` tails
+  daemon/stdout/stderr/managed log files without a live daemon, following
+  generation changes. Follow-ups landed 2026-09-29: capability-gated
+  `Inspect` returning a typed `InstanceReport` (mode, state, pids, uptime,
+  streams, event counters, log filter); clean stop and crash repair now keep
+  generation logs within `LogPolicy` retention and `logs()` falls back to the
+  newest retained generation; `blocking` wrappers for events, logs, filter,
+  diagnostics, and inspect. Docs in `docs/USAGE.md`.
+
 ## Verification
 
-- Local Linux: native lifecycle (14 real-process cases), layout/path-limit
-  regression, rustfmt, strict Clippy, rustdoc, MSRV 1.81 library check, and
-  `git diff --check` pass.
+- Local Linux: native lifecycle (18 real-process cases, including tracing
+  replay/filter/reload/restart, file tail and retention across restart and
+  stop, managed line events, inspect reports, and blocking wrappers),
+  layout/path-limit regression, rustfmt, strict Clippy, rustdoc, MSRV 1.81
+  library check, all CI feature rows, and `git diff --check` pass. The MSRV
+  check had been broken on `master` by the lock resolving uuid 1.24.1 and
+  tempfile 3.27 to getrandom 0.4.3 (Edition 2024 manifest); the lock now
+  pins uuid 1.16.0 and tempfile 3.20.0. Do not `cargo update` those without
+  re-running the MSRV job.
 - Hosted GitHub Actions: Ubuntu, macOS, and Windows all execute platform
   storage/security/transport/protocol contracts plus real embedded and managed
   lifecycle suites. The matrix also covers six feature configurations, public
@@ -49,7 +71,9 @@ supervised managed children; the cross-platform CI matrix is active and passing.
 
 ## Next
 
-`v0.1.0` is released. The tag-triggered workflow reran every gate before
-publishing `daemonkit`, then `daemonkit-testkit`, and creating the GitHub
-release. Next: Phase 5 platform/race/security/resource hardening, benchmarks,
-and debugger-cli/ghidra-cli migration spikes.
+The event/tail/inspect work is implemented and verified locally but not yet
+committed or pushed; hosted macOS/Windows legs still need a CI run (new
+`tracing-native` matrix row added). Then: Phase 5 hardening, benchmarks, and
+the debugger-cli/ghidra-cli migration spikes, which should exercise
+`tail --follow`, `status --json` via `inspect`, and `set_log_filter` end to
+end from a real CLI.

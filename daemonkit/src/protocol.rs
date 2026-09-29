@@ -43,17 +43,83 @@ pub enum ControlMessage {
     OpenApplicationStream {
         request_id: u64,
     },
+    /// Turn this control connection into a one-way event stream: `replay`
+    /// newest retained events first, then live events while `follow`.
+    OpenEventStream {
+        request_id: u64,
+        replay: u32,
+        follow: bool,
+        filter: String,
+    },
+    /// Replace the daemon's reloadable log filter at runtime.
+    SetLogFilter {
+        request_id: u64,
+        directives: String,
+    },
+    /// Ask the generation for a typed self-report.
+    Inspect {
+        request_id: u64,
+    },
 }
 
 #[cfg(feature = "runtime-tokio")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ControlResponse {
-    Status { request_id: u64, state: u8 },
-    Accepted { request_id: u64 },
-    Diagnostics { request_id: u64, bytes: Vec<u8> },
-    ApplicationStream { request_id: u64 },
-    BusyQuiescing { request_id: u64 },
-    Unsupported { request_id: u64 },
+    Status {
+        request_id: u64,
+        state: u8,
+    },
+    Accepted {
+        request_id: u64,
+    },
+    Diagnostics {
+        request_id: u64,
+        bytes: Vec<u8>,
+    },
+    ApplicationStream {
+        request_id: u64,
+    },
+    BusyQuiescing {
+        request_id: u64,
+    },
+    Unsupported {
+        request_id: u64,
+    },
+    EventStream {
+        request_id: u64,
+    },
+    Rejected {
+        request_id: u64,
+        reason: String,
+    },
+    /// JSON-encoded `InstanceReport`.
+    Inspect {
+        request_id: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+/// One frame of an event stream, JSON-encoded after `WIRE_EVENT`.
+#[cfg(feature = "runtime-tokio")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum WireEvent {
+    Event(crate::events::Event),
+    Lagged { dropped: u64 },
+    End { reason: EndReason },
+}
+
+/// Why the daemon ended an event stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum EndReason {
+    /// The replay completed and the subscription did not ask to follow.
+    Replayed,
+    /// The daemon generation is shutting down.
+    Shutdown,
+    /// The daemon closed the connection without an explicit end frame.
+    Disconnected,
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -73,10 +139,12 @@ impl ControlSession {
         }
     }
 
+    /// `payload` carries the daemon-supplied bytes for `Diagnostics` and
+    /// `Inspect`; other requests ignore it.
     pub(crate) fn handle(
         &mut self,
         request: &ControlMessage,
-        diagnostics: &[u8],
+        payload: &[u8],
     ) -> Result<ControlResponse, ProtocolError> {
         if self.role != ConnectionRole::Control {
             return Err(ProtocolError::RoleViolation);
@@ -92,6 +160,13 @@ impl ControlSession {
             ControlMessage::OpenApplicationStream { request_id } => {
                 (*request_id, Capabilities::APPLICATION_STREAM)
             }
+            ControlMessage::OpenEventStream { request_id, .. } => {
+                (*request_id, Capabilities::EVENTS)
+            }
+            ControlMessage::SetLogFilter { request_id, .. } => {
+                (*request_id, Capabilities::LOG_FILTER)
+            }
+            ControlMessage::Inspect { request_id } => (*request_id, Capabilities::INSPECT),
         };
         if !self.capabilities.contains(needed) {
             return Ok(ControlResponse::Unsupported { request_id });
@@ -114,7 +189,11 @@ impl ControlSession {
             }
             ControlMessage::Diagnostics { .. } => ControlResponse::Diagnostics {
                 request_id,
-                bytes: diagnostics[..diagnostics.len().min(MAX_DIAGNOSTICS_BYTES)].to_vec(),
+                bytes: payload[..payload.len().min(MAX_DIAGNOSTICS_BYTES)].to_vec(),
+            },
+            ControlMessage::Inspect { .. } => ControlResponse::Inspect {
+                request_id,
+                bytes: payload[..payload.len().min(MAX_INSPECT_BYTES)].to_vec(),
             },
             ControlMessage::OpenApplicationStream { .. } if self.state == STATE_QUIESCING => {
                 ControlResponse::BusyQuiescing { request_id }
@@ -125,6 +204,26 @@ impl ControlSession {
             ControlMessage::OpenApplicationStream { .. } => {
                 ControlResponse::Unsupported { request_id }
             }
+            // Event streams are useful in every state, including while the
+            // generation quiesces or stops: that is when people tail logs.
+            ControlMessage::OpenEventStream { filter, .. } => {
+                match crate::events::EventFilter::parse(filter) {
+                    Ok(_) => ControlResponse::EventStream { request_id },
+                    Err(error) => ControlResponse::Rejected {
+                        request_id,
+                        reason: error.message().to_owned(),
+                    },
+                }
+            }
+            ControlMessage::SetLogFilter { directives, .. } => {
+                match crate::events::EventFilter::parse(directives) {
+                    Ok(_) => ControlResponse::Accepted { request_id },
+                    Err(error) => ControlResponse::Rejected {
+                        request_id,
+                        reason: error.message().to_owned(),
+                    },
+                }
+            }
             ControlMessage::Hello { .. } => unreachable!("rejected above"),
         })
     }
@@ -134,6 +233,7 @@ const STATE_READY: u8 = 3;
 const STATE_QUIESCING: u8 = 4;
 const STATE_STOPPING: u8 = 5;
 const MAX_DIAGNOSTICS_BYTES: usize = 32 * 1024;
+const MAX_INSPECT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Capabilities(u64);
@@ -144,6 +244,9 @@ impl Capabilities {
     pub(crate) const SHUTDOWN: Self = Self(1 << 2);
     pub(crate) const DIAGNOSTICS: Self = Self(1 << 3);
     pub(crate) const APPLICATION_STREAM: Self = Self(1 << 4);
+    pub(crate) const EVENTS: Self = Self(1 << 5);
+    pub(crate) const LOG_FILTER: Self = Self(1 << 6);
+    pub(crate) const INSPECT: Self = Self(1 << 7);
 
     pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -422,6 +525,8 @@ const WIRE_CLIENT_HELLO: u8 = 1;
 const WIRE_SERVER_HELLO: u8 = 2;
 const WIRE_CONTROL_REQUEST: u8 = 3;
 const WIRE_CONTROL_RESPONSE: u8 = 4;
+const WIRE_EVENT: u8 = 6;
+const MAX_REASON_BYTES: usize = 1024;
 const WIRE_REJECT: u8 = 255;
 const WIRE_BUSY_QUIESCING: u8 = 254;
 const MAX_PROCESS_IDENTITY: usize = 1024;
@@ -553,10 +658,52 @@ fn encode_control_request(request: &ControlMessage) -> Result<Vec<u8>, ProtocolE
         ControlMessage::Shutdown { request_id } => (3, request_id),
         ControlMessage::Diagnostics { request_id } => (4, request_id),
         ControlMessage::OpenApplicationStream { request_id } => (5, request_id),
+        ControlMessage::OpenEventStream { request_id, .. } => (6, request_id),
+        ControlMessage::SetLogFilter { request_id, .. } => (7, request_id),
+        ControlMessage::Inspect { request_id } => (8, request_id),
     };
     bytes.push(kind);
     bytes.extend_from_slice(&request_id.to_be_bytes());
+    match request {
+        ControlMessage::OpenEventStream {
+            replay,
+            follow,
+            filter,
+            ..
+        } => {
+            bytes.extend_from_slice(&replay.to_be_bytes());
+            bytes.push(u8::from(*follow));
+            encode_string(&mut bytes, filter, crate::events::MAX_FILTER_BYTES)?;
+        }
+        ControlMessage::SetLogFilter { directives, .. } => {
+            encode_string(&mut bytes, directives, crate::events::MAX_FILTER_BYTES)?;
+        }
+        _ => {}
+    }
     Ok(bytes)
+}
+
+#[cfg(feature = "runtime-tokio")]
+fn encode_string(bytes: &mut Vec<u8>, value: &str, maximum: usize) -> Result<(), ProtocolError> {
+    if value.len() > maximum {
+        return Err(ProtocolError::Malformed("string field is too large"));
+    }
+    bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl<'a> Decoder<'a> {
+    fn string(&mut self, maximum: usize) -> Result<String, ProtocolError> {
+        let length = u16::from_be_bytes(self.array()?) as usize;
+        if length > maximum {
+            return Err(ProtocolError::Malformed("string field is too large"));
+        }
+        std::str::from_utf8(self.bytes(length)?)
+            .map(str::to_owned)
+            .map_err(|_| ProtocolError::Malformed("string field is not UTF-8"))
+    }
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -567,15 +714,31 @@ fn decode_control_request(bytes: &[u8]) -> Result<ControlMessage, ProtocolError>
     }
     let kind = decoder.byte()?;
     let request_id = u64::from_be_bytes(decoder.array()?);
-    decoder.finish()?;
-    Ok(match kind {
+    let request = match kind {
         1 => ControlMessage::Status { request_id },
         2 => ControlMessage::Drain { request_id },
         3 => ControlMessage::Shutdown { request_id },
         4 => ControlMessage::Diagnostics { request_id },
         5 => ControlMessage::OpenApplicationStream { request_id },
+        6 => ControlMessage::OpenEventStream {
+            request_id,
+            replay: u32::from_be_bytes(decoder.array()?),
+            follow: match decoder.byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProtocolError::Malformed("invalid follow flag")),
+            },
+            filter: decoder.string(crate::events::MAX_FILTER_BYTES)?,
+        },
+        7 => ControlMessage::SetLogFilter {
+            request_id,
+            directives: decoder.string(crate::events::MAX_FILTER_BYTES)?,
+        },
+        8 => ControlMessage::Inspect { request_id },
         _ => return Err(ProtocolError::Malformed("unknown control request")),
-    })
+    };
+    decoder.finish()?;
+    Ok(request)
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -589,6 +752,9 @@ fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
         ControlResponse::ApplicationStream { request_id } => (4, request_id),
         ControlResponse::BusyQuiescing { request_id } => (5, request_id),
         ControlResponse::Unsupported { request_id } => (6, request_id),
+        ControlResponse::EventStream { request_id } => (7, request_id),
+        ControlResponse::Rejected { request_id, .. } => (8, request_id),
+        ControlResponse::Inspect { request_id, .. } => (9, request_id),
     };
     bytes.push(kind);
     bytes.extend_from_slice(&request_id.to_be_bytes());
@@ -599,6 +765,15 @@ fn encode_control_response(response: &ControlResponse) -> Vec<u8> {
         } => {
             bytes.extend_from_slice(&(diagnostics.len() as u32).to_be_bytes());
             bytes.extend_from_slice(diagnostics);
+        }
+        ControlResponse::Rejected { reason, .. } => {
+            let mut reason = reason.clone();
+            crate::events::truncate_utf8(&mut reason, MAX_REASON_BYTES);
+            let _ = encode_string(&mut bytes, &reason, MAX_REASON_BYTES);
+        }
+        ControlResponse::Inspect { bytes: report, .. } => {
+            bytes.extend_from_slice(&(report.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(report);
         }
         _ => {}
     }
@@ -632,10 +807,75 @@ fn decode_control_response(bytes: &[u8]) -> Result<ControlResponse, ProtocolErro
         4 => ControlResponse::ApplicationStream { request_id },
         5 => ControlResponse::BusyQuiescing { request_id },
         6 => ControlResponse::Unsupported { request_id },
+        7 => ControlResponse::EventStream { request_id },
+        8 => ControlResponse::Rejected {
+            request_id,
+            reason: decoder.string(MAX_REASON_BYTES)?,
+        },
+        9 => {
+            let length = u32::from_be_bytes(decoder.array()?) as usize;
+            if length > MAX_INSPECT_BYTES {
+                return Err(ProtocolError::Malformed("inspect response too large"));
+            }
+            ControlResponse::Inspect {
+                request_id,
+                bytes: decoder.bytes(length)?.to_vec(),
+            }
+        }
         _ => return Err(ProtocolError::Malformed("unknown control response")),
     };
     decoder.finish()?;
     Ok(response)
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub(crate) async fn write_event_frame<S>(
+    stream: &mut S,
+    event: &WireEvent,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut bytes = Vec::with_capacity(256);
+    bytes.push(WIRE_EVENT);
+    serde_json::to_writer(&mut bytes, event)
+        .map_err(|_| ProtocolError::Malformed("event is not serializable"))?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        // The hub bounds events well below the frame limit; this is a last
+        // resort so one pathological event cannot poison the stream.
+        let replacement = match event {
+            WireEvent::Event(inner) => {
+                let mut cut = crate::events::Event::new(
+                    inner.source,
+                    inner.level,
+                    inner.target.clone(),
+                    "[event exceeded the control frame limit]",
+                );
+                cut.sequence = inner.sequence;
+                cut.unix_millis = inner.unix_millis;
+                cut.truncated = true;
+                WireEvent::Event(cut)
+            }
+            other => other.clone(),
+        };
+        bytes.truncate(1);
+        serde_json::to_writer(&mut bytes, &replacement)
+            .map_err(|_| ProtocolError::Malformed("event is not serializable"))?;
+    }
+    write_frame(stream, &bytes).await
+}
+
+#[cfg(feature = "runtime-tokio")]
+pub(crate) async fn read_event_frame<S>(stream: &mut S) -> Result<WireEvent, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    let bytes = read_frame(stream).await?;
+    match bytes.split_first() {
+        Some((&WIRE_EVENT, payload)) => serde_json::from_slice(payload)
+            .map_err(|_| ProtocolError::Malformed("event frame is not valid JSON")),
+        _ => Err(ProtocolError::Malformed("expected event frame")),
+    }
 }
 
 fn negotiate(client: ProtocolRange, server: ProtocolRange) -> Option<u16> {
@@ -974,5 +1214,184 @@ mod tests {
         assert!(format!("{hello:?}").contains("[REDACTED]"));
         assert!(format!("{identity:?}").contains("[REDACTED]"));
         assert!(!format!("{hello:?}{identity:?}").contains(&format!("{:?}", [5u8; 32])));
+    }
+
+    #[tokio::test]
+    async fn event_stream_and_log_filter_messages_round_trip_with_bounded_strings() {
+        let requests = [
+            ControlMessage::OpenEventStream {
+                request_id: 9,
+                replay: u32::MAX,
+                follow: true,
+                filter: "info,app=debug".into(),
+            },
+            ControlMessage::OpenEventStream {
+                request_id: 10,
+                replay: 0,
+                follow: false,
+                filter: String::new(),
+            },
+            ControlMessage::SetLogFilter {
+                request_id: 11,
+                directives: "warn".into(),
+            },
+        ];
+        for request in requests {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            write_control_request(&mut client, &request).await.unwrap();
+            assert_eq!(read_control_request(&mut server).await.unwrap(), request);
+        }
+        let oversized = ControlMessage::SetLogFilter {
+            request_id: 1,
+            directives: "a".repeat(crate::events::MAX_FILTER_BYTES + 1),
+        };
+        assert!(encode_control_request(&oversized).is_err());
+        assert!(decode_control_request(&[
+            WIRE_CONTROL_REQUEST,
+            6,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            0
+        ])
+        .is_err());
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let inspect = ControlMessage::Inspect { request_id: 12 };
+        write_control_request(&mut client, &inspect).await.unwrap();
+        assert_eq!(read_control_request(&mut server).await.unwrap(), inspect);
+        let responses = [
+            ControlResponse::EventStream { request_id: 9 },
+            ControlResponse::Inspect {
+                request_id: 12,
+                bytes: b"{}".to_vec(),
+            },
+            ControlResponse::Rejected {
+                request_id: 11,
+                reason: "unknown level".into(),
+            },
+        ];
+        for response in responses {
+            assert_eq!(
+                decode_control_response(&encode_control_response(&response)).unwrap(),
+                response
+            );
+        }
+        let long_reason = ControlResponse::Rejected {
+            request_id: 1,
+            reason: "r".repeat(MAX_REASON_BYTES + 100),
+        };
+        match decode_control_response(&encode_control_response(&long_reason)).unwrap() {
+            ControlResponse::Rejected { reason, .. } => assert_eq!(reason.len(), MAX_REASON_BYTES),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_frames_round_trip_and_oversized_events_are_cut_not_dropped() {
+        let (mut client, mut server) = tokio::io::duplex(MAX_FRAME_BYTES * 2);
+        let event = crate::events::Event::new(
+            crate::events::EventSource::Stdout,
+            crate::events::Level::Warn,
+            "stdout",
+            "hello",
+        )
+        .field("k", "v");
+        for frame in [
+            WireEvent::Event(event),
+            WireEvent::Lagged { dropped: 7 },
+            WireEvent::End {
+                reason: EndReason::Shutdown,
+            },
+        ] {
+            write_event_frame(&mut server, &frame).await.unwrap();
+            assert_eq!(read_event_frame(&mut client).await.unwrap(), frame);
+        }
+        let huge = WireEvent::Event(crate::events::Event::new(
+            crate::events::EventSource::Application,
+            crate::events::Level::Info,
+            "t",
+            "x".repeat(MAX_FRAME_BYTES),
+        ));
+        write_event_frame(&mut server, &huge).await.unwrap();
+        match read_event_frame(&mut client).await.unwrap() {
+            WireEvent::Event(cut) => {
+                assert!(cut.truncated);
+                assert!(cut.message.len() < 128);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        write_frame(&mut server, &[WIRE_CONTROL_RESPONSE, 1])
+            .await
+            .unwrap();
+        assert!(read_event_frame(&mut client).await.is_err());
+    }
+
+    #[test]
+    fn control_session_gates_events_and_filters_on_capabilities_and_validity() {
+        let all = Capabilities::EVENTS
+            .union(Capabilities::LOG_FILTER)
+            .union(Capabilities::INSPECT);
+        let mut session = ControlSession::new(ConnectionRole::Control, STATE_QUIESCING, all);
+        let open = ControlMessage::OpenEventStream {
+            request_id: 1,
+            replay: 5,
+            follow: true,
+            filter: "info".into(),
+        };
+        assert_eq!(
+            session.handle(&open, &[]).unwrap(),
+            ControlResponse::EventStream { request_id: 1 }
+        );
+        let bad = ControlMessage::OpenEventStream {
+            request_id: 2,
+            replay: 5,
+            follow: true,
+            filter: "loud".into(),
+        };
+        assert!(matches!(
+            session.handle(&bad, &[]).unwrap(),
+            ControlResponse::Rejected { request_id: 2, .. }
+        ));
+        let set = ControlMessage::SetLogFilter {
+            request_id: 3,
+            directives: "debug,x=off".into(),
+        };
+        assert_eq!(
+            session.handle(&set, &[]).unwrap(),
+            ControlResponse::Accepted { request_id: 3 }
+        );
+        assert_eq!(
+            session
+                .handle(&ControlMessage::Inspect { request_id: 4 }, b"{}")
+                .unwrap(),
+            ControlResponse::Inspect {
+                request_id: 4,
+                bytes: b"{}".to_vec()
+            }
+        );
+        let mut limited =
+            ControlSession::new(ConnectionRole::Control, STATE_READY, Capabilities::EVENTS);
+        assert_eq!(
+            limited.handle(&set, &[]).unwrap(),
+            ControlResponse::Unsupported { request_id: 3 }
+        );
+        let mut none =
+            ControlSession::new(ConnectionRole::Control, STATE_READY, Capabilities::STATUS);
+        assert_eq!(
+            none.handle(&open, &[]).unwrap(),
+            ControlResponse::Unsupported { request_id: 1 }
+        );
     }
 }

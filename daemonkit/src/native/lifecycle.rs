@@ -16,8 +16,8 @@ use crate::{
         ControlEndpointRecord, InstanceRecord, ServiceEndpointRecord, INSTANCE_RECORD_SCHEMA,
     },
     BinaryCompatibility, Compatibility, DaemonKey, DaemonSpec, Error, GenerationId, InstanceId,
-    InstanceStatus, InstanceSummary, LifecycleState, LogPolicy, MismatchAction, RepairAction,
-    RepairOutcome, RuntimeRoot, Spawn, StartupDiagnostics, StartupPhase, StopOutcome,
+    InstanceReport, InstanceStatus, InstanceSummary, LifecycleState, LogPolicy, MismatchAction,
+    RepairAction, RepairOutcome, RuntimeRoot, Spawn, StartupDiagnostics, StartupPhase, StopOutcome,
 };
 use std::{
     fs::{File, OpenOptions},
@@ -415,7 +415,9 @@ impl NativeController {
         })?;
         drop(lease_guard);
         layout.record_store().clear().map_err(map_store)?;
-        let _ = std::fs::remove_dir_all(&record.generation_directory);
+        // Keep the stopped generation's logs within the retention policy so
+        // `logs()` can still explain what happened after a clean stop.
+        let _ = layout.prune_generations(&self.logs, None, None);
         Ok(StopOutcome::Stopped {
             generation: record.generation,
             forced: false,
@@ -452,7 +454,9 @@ impl NativeController {
                 })?;
         drop(guard);
         layout.record_store().clear().map_err(map_store)?;
-        let _ = std::fs::remove_dir_all(&record.generation_directory);
+        // A crashed generation's logs are the most valuable ones: protect
+        // them from pruning until a newer generation exists.
+        let _ = layout.prune_generations(&self.logs, None, Some(record.generation));
         Ok(())
     }
 
@@ -461,6 +465,118 @@ impl NativeController {
         record: &InstanceRecord,
     ) -> Result<NativeStream, Error> {
         self.authenticate(record, ConnectionRole::Application).await
+    }
+
+    /// Read the discovery record without authenticating. Possession never
+    /// proves liveness; callers that need a live daemon use `attach`.
+    pub(crate) fn read_record(&self) -> Result<Option<InstanceRecord>, Error> {
+        let layout = self.layout()?;
+        let Some(record) = layout.record_store().read_record().map_err(map_store)? else {
+            return Ok(None);
+        };
+        self.verify_record_authority(&record)?;
+        Ok(Some(record))
+    }
+
+    /// Newest retained generation directory, for log reads without a record.
+    pub(crate) fn newest_generation(&self) -> Result<Option<(GenerationId, PathBuf)>, Error> {
+        Ok(self.layout()?.newest_generation_directory())
+    }
+
+    pub(crate) async fn inspect(&self, record: &InstanceRecord) -> Result<InstanceReport, Error> {
+        let mut stream = self.authenticate(record, ConnectionRole::Control).await?;
+        let response = request(
+            &mut stream,
+            ControlMessage::Inspect { request_id: 1 },
+            self.startup_timeout,
+        )
+        .await?;
+        match response {
+            ControlResponse::Inspect { bytes, .. } => {
+                serde_json::from_slice(&bytes).map_err(|error| Error::CorruptState {
+                    path: record.generation_directory.clone(),
+                    message: format!("inspect report is not valid JSON: {error}"),
+                })
+            }
+            ControlResponse::Unsupported { .. } => Err(Error::Unsupported),
+            _ => Err(Error::Unavailable {
+                generation: Some(record.generation),
+            }),
+        }
+    }
+
+    /// Open an authenticated control connection that the daemon has turned
+    /// into a one-way event stream.
+    pub(crate) async fn open_event_stream(
+        &self,
+        record: &InstanceRecord,
+        replay: u32,
+        follow: bool,
+        filter: &str,
+    ) -> Result<NativeStream, Error> {
+        let mut stream = self.authenticate(record, ConnectionRole::Control).await?;
+        let response = request(
+            &mut stream,
+            ControlMessage::OpenEventStream {
+                request_id: 1,
+                replay,
+                follow,
+                filter: filter.to_owned(),
+            },
+            self.startup_timeout,
+        )
+        .await?;
+        match response {
+            ControlResponse::EventStream { .. } => Ok(stream),
+            ControlResponse::Rejected { reason, .. } => Err(Error::Rejected { message: reason }),
+            ControlResponse::Unsupported { .. } => Err(Error::Unsupported),
+            _ => Err(Error::Unavailable {
+                generation: Some(record.generation),
+            }),
+        }
+    }
+
+    pub(crate) async fn set_log_filter(
+        &self,
+        record: &InstanceRecord,
+        directives: &str,
+    ) -> Result<(), Error> {
+        let mut stream = self.authenticate(record, ConnectionRole::Control).await?;
+        let response = request(
+            &mut stream,
+            ControlMessage::SetLogFilter {
+                request_id: 1,
+                directives: directives.to_owned(),
+            },
+            self.startup_timeout,
+        )
+        .await?;
+        match response {
+            ControlResponse::Accepted { .. } => Ok(()),
+            ControlResponse::Rejected { reason, .. } => Err(Error::Rejected { message: reason }),
+            ControlResponse::Unsupported { .. } => Err(Error::Unsupported),
+            _ => Err(Error::Unavailable {
+                generation: Some(record.generation),
+            }),
+        }
+    }
+
+    /// Recent events rendered as text by the daemon, bounded by the protocol.
+    pub(crate) async fn diagnostics(&self, record: &InstanceRecord) -> Result<Vec<u8>, Error> {
+        let mut stream = self.authenticate(record, ConnectionRole::Control).await?;
+        let response = request(
+            &mut stream,
+            ControlMessage::Diagnostics { request_id: 1 },
+            self.startup_timeout,
+        )
+        .await?;
+        match response {
+            ControlResponse::Diagnostics { bytes, .. } => Ok(bytes),
+            ControlResponse::Unsupported { .. } => Err(Error::Unsupported),
+            _ => Err(Error::Unavailable {
+                generation: Some(record.generation),
+            }),
+        }
     }
 
     async fn authenticate(

@@ -25,6 +25,43 @@ impl<'de> Deserialize<'de> for GenerationId {
     }
 }
 
+/// Which runtime shape a generation runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DaemonMode {
+    Embedded,
+    Managed,
+}
+
+/// Live self-report from a running generation, for `status --json` style
+/// output. Serializable; unknown future fields are ignored by older clients.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct InstanceReport {
+    pub generation: GenerationId,
+    pub mode: DaemonMode,
+    pub state: LifecycleState,
+    /// The daemonkit process: the service itself when embedded, the
+    /// supervisor when managed.
+    pub process_id: u32,
+    /// The supervised program's process, when managed and still known.
+    #[serde(default)]
+    pub managed_process_id: Option<u32>,
+    pub uptime_millis: u64,
+    /// Authenticated application streams currently open (embedded only).
+    #[serde(default)]
+    pub active_streams: usize,
+    /// Events published by this generation so far.
+    #[serde(default)]
+    pub events_published: u64,
+    /// Live event subscribers.
+    #[serde(default)]
+    pub event_subscribers: usize,
+    /// Directives of the reloadable log filter, when one is installed.
+    #[serde(default)]
+    pub log_filter: Option<String>,
+}
+
 /// Lifecycle states visible to the deterministic kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LifecycleState {

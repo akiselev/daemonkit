@@ -60,7 +60,10 @@ impl LaunchConfig {
                 .union(Capabilities::DRAIN)
                 .union(Capabilities::SHUTDOWN)
                 .union(Capabilities::DIAGNOSTICS)
-                .union(Capabilities::APPLICATION_STREAM),
+                .union(Capabilities::APPLICATION_STREAM)
+                .union(Capabilities::EVENTS)
+                .union(Capabilities::LOG_FILTER)
+                .union(Capabilities::INSPECT),
             service_endpoint: None,
         }
     }

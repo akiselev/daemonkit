@@ -16,6 +16,7 @@ native-process = []
 blocking = ["runtime-tokio"]
 advanced = []
 testkit = []
+tracing = ["runtime-tokio", "dep:tracing-core", "dep:tracing-subscriber"]
 
 [dependencies]
 futures-core.workspace = true
@@ -27,11 +28,15 @@ sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
+tracing-core = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
+tracing = "0.1"
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 trybuild = "1.0"
 
 [target.'cfg(unix)'.dependencies]

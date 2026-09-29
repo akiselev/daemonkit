@@ -12,6 +12,7 @@ pub mod blocking;
 #[cfg(feature = "runtime-tokio")]
 mod child;
 mod error;
+pub mod events;
 mod facade;
 mod identity;
 mod model;
@@ -22,6 +23,14 @@ mod protocol;
 #[allow(dead_code)]
 mod record;
 mod secret;
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "native-process",
+    feature = "native-transport"
+))]
+mod tail;
+#[cfg(all(feature = "tracing", feature = "runtime-tokio"))]
+pub mod tracing;
 
 #[cfg(feature = "runtime-tokio")]
 pub use child::{
@@ -30,6 +39,9 @@ pub use child::{
     ReadinessContext, ReadinessResult, ServiceContext, Shutdown, ShutdownStrategy,
 };
 pub use error::{Error, InstanceId, RedactedSource, StartupDiagnostics, StartupPhase};
+#[cfg(feature = "runtime-tokio")]
+pub use events::EventSink;
+pub use events::{Event, EventFilter, EventPolicy, EventSource, FilterError, Level};
 #[cfg(feature = "runtime-tokio")]
 pub use facade::AuthenticatedStream;
 pub use facade::{
@@ -43,8 +55,15 @@ pub use identity::{
     LogPolicy, MismatchAction, PathKey, ProtocolRange, RuntimeRoot, StringKey, TransportConfig,
     UuidKey,
 };
-pub use model::{GenerationId, LifecycleState, TransitionError};
+pub use model::{DaemonMode, GenerationId, InstanceReport, LifecycleState, TransitionError};
+pub use protocol::EndReason;
 pub use secret::Secret;
+#[cfg(all(
+    feature = "runtime-tokio",
+    feature = "native-process",
+    feature = "native-transport"
+))]
+pub use tail::{EventItem, EventStream, EventTail, LogItem, LogSource, LogStream, LogTail};
 
 /// Marker selecting an embedded byte-stream service.
 #[derive(Debug)]

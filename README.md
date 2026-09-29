@@ -18,6 +18,9 @@ has been proved.
 - Authenticated Unix sockets on Unix and authenticated local named pipes on
   Windows.
 - Graceful shutdown with forced process-tree cleanup as a fallback.
+- Structured events clients can tail live (`tail --follow`), an optional
+  `tracing` layer with a runtime-reloadable filter, and file-based log
+  tailing that works when the daemon is dead.
 - A deterministic companion simulator, `daemonkit-testkit`, for lifecycle
   races, injected faults, replay, and invariant testing.
 

@@ -67,6 +67,8 @@ pub enum Error {
     CorruptState { path: PathBuf, message: String },
     #[error("operation is not implemented by the current backend")]
     Unsupported,
+    #[error("daemon rejected the request: {message}")]
+    Rejected { message: String },
 }
 
 impl Error {

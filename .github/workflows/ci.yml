@@ -73,6 +73,8 @@ jobs:
             args: --no-default-features --features blocking,native-process,native-transport
           - name: advanced-native
             args: --no-default-features --features advanced,runtime-tokio,native-process,native-transport
+          - name: tracing-native
+            args: --no-default-features --features tracing,native-process,native-transport
           - name: all
             args: --all-features
     steps:

@@ -85,6 +85,39 @@ impl InstanceLayout {
 
     /// Prune oldest inactive generations by both count and aggregate bytes.
     /// The active and most recently failed generations are never candidates.
+    /// Newest retained generation directory by modification time, if any.
+    /// Used to read logs after the discovery record has been cleared.
+    pub(crate) fn newest_generation_directory(&self) -> Option<(GenerationId, PathBuf)> {
+        let generations = self.directory.join("generations");
+        let entries = fs::read_dir(&generations).ok()?;
+        let mut newest: Option<(SystemTime, GenerationId, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Some(generation) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| u128::from_str_radix(name, 16).ok())
+                .map(GenerationId)
+            else {
+                continue;
+            };
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if newest
+                .as_ref()
+                .map_or(true, |(current, ..)| modified >= *current)
+            {
+                newest = Some((modified, generation, path));
+            }
+        }
+        newest.map(|(_, generation, path)| (generation, path))
+    }
+
     pub(crate) fn prune_generations(
         &self,
         policy: &LogPolicy,
@@ -324,6 +357,26 @@ mod tests {
             .parent()
             .and_then(|path| path.file_name())
             .is_some_and(|name| name.to_string_lossy().starts_with("daemonkit-")));
+    }
+
+    #[test]
+    fn newest_generation_directory_ignores_foreign_entries() {
+        let (_parent, layout) = layout();
+        assert!(layout.newest_generation_directory().is_none());
+        for id in [5u128, 9, 2] {
+            let generation = layout.create_generation(GenerationId(id)).unwrap();
+            fs::write(generation.path().join("daemon.log"), b"x").unwrap();
+            let later = SystemTime::now() + std::time::Duration::from_secs(id as u64);
+            fs::File::open(generation.path())
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        fs::write(layout.path().join("generations").join("notes"), b"x").unwrap();
+        fs::create_dir(layout.path().join("generations").join("not-hex")).unwrap();
+        let (generation, path) = layout.newest_generation_directory().unwrap();
+        assert_eq!(generation, GenerationId(9));
+        assert!(path.ends_with(format!("{:032x}", 9)));
     }
 
     #[test]

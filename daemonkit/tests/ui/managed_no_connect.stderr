@@ -1,7 +1,7 @@
-error[E0599]: no method named `connect` found for struct `daemonkit::Instance<Managed>` in the current scope
+error[E0599]: no method named `connect` found for struct `daemonkit::Instance<daemonkit::Managed>` in the current scope
  --> tests/ui/managed_no_connect.rs:4:22
   |
 4 |     let _ = instance.connect().await;
-  |                      ^^^^^^^ method not found in `daemonkit::Instance<Managed>`
+  |                      ^^^^^^^ method not found in `daemonkit::Instance<daemonkit::Managed>`
   |
-  = note: the method was found for `daemonkit::Instance<Embedded>`
+  = note: the method was found for `daemonkit::Instance<daemonkit::Embedded>`
